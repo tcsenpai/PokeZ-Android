@@ -468,6 +468,24 @@ static void begin_cb(VkCommandBuffer *cb, bool *begun) {
 }
 
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...);
+// ---- LARECOMP_VK_LAZY_PASS=1: a render pass begins at its first command, not when its targets are bound. A
+// full-area clear before any draw becomes the attachment's load op (CLEAR instead of LOAD then a clear: a tiler -
+// Turnip's GMEM - skips loading each tile), and a pass with no command and nothing to clear is never recorded.
+// begin_pass keeps the pass's rendering info here; vk_cmd() (every recording path asks it for the command buffer)
+// begins it first.
+static int lazy_pass = -1;
+static bool pass_pending;
+static VkRenderingInfo pend_ri;
+static VkRenderingAttachmentInfo pend_ca[8], pend_da, pend_sa;
+static uint64_t lazy_stat[3];  // passes dropped (nothing in them), clears made load ops, passes begun late
+static void pass_flush(VkCommandBuffer cb) {
+    pass_pending = false;
+    pend_ri.pColorAttachments = pend_ri.colorAttachmentCount ? pend_ca : NULL;
+    pend_ri.pDepthAttachment = pend_ri.pDepthAttachment ? &pend_da : NULL;
+    pend_ri.pStencilAttachment = pend_ri.pStencilAttachment ? &pend_sa : NULL;
+    rec_CmdBeginRendering(cb, &pend_ri);
+    lazy_stat[2]++;
+}
 VkCommandBuffer vk_cmd(void) {
     Sub *s = sub();
     if (!s->main_begun) {
@@ -486,13 +504,14 @@ VkCommandBuffer vk_cmd(void) {
             pthread_mutex_unlock(&cq_lock);
             if (q->pool) rec_CmdResetQueryPool(s->main, q->pool, 0, CQ_MAX);
         }
-        gp_mark(s->main, "(submission start; includes GPU idle before it)");
+        gp_mark(s->main, "(submission start: its work outside the passes below, e.g. the window image's)");
         if (prof_qp) {
             rec_CmdResetQueryPool(s->main, prof_qp, (uint32_t)cur_sub * 3, 3);
             rec_CmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_NONE, prof_qp, (uint32_t)cur_sub * 3);
             s->ts = true;
         }
     }
+    if (pass_pending) pass_flush(s->main);
     return s->main;
 }
 
@@ -571,8 +590,8 @@ static void gw_explain(uint64_t pa) {
     LOG("\n");
 }
 
-static char gp_label[512][112];
-static uint32_t gp_draws[512];
+static char gp_label[512][192];
+static uint32_t gp_draws[512], gp_clears[512], gp_clears_first[512];  // (clears: before the row's first draw, full area)
 // LARECOMP_VK_DEVLOST_TRACE=1: the last 64 GPU operations, dumped on device loss (with LARECOMP_SYNC_SUBMIT=1 the
 // dump ends with the command list that faulted).
 #define DL_N 4096  // (a power of two)
@@ -636,7 +655,7 @@ static void gp_mark(VkCommandBuffer cb, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(gp_label[gp_n], sizeof gp_label[0], fmt, ap);
     va_end(ap);
-    gp_draws[gp_n] = 0;
+    gp_draws[gp_n] = gp_clears[gp_n] = gp_clears_first[gp_n] = 0;
     gp_n++;
 }
 void renderer_flush(void);
@@ -649,8 +668,10 @@ void vk_gpuprof_report(void) {
         LOG("[gpuprof] %d marks, %.2f ms first to last (rows: the work after each mark, until the next)\n", gp_n, total);
         for (int i = 0; i + 1 < gp_n; i++) {
             double ms = (t[i + 1] - t[i]) * per;
-            LOG("[gpuprof] %6.3f ms %5.1f%%  %s%s", ms, 100 * ms / (total > 0 ? total : 1), gp_label[i], gp_draws[i] ? "" : "\n");
-            if (gp_draws[i]) LOG(", %u draws\n", gp_draws[i]);
+            LOG("[gpuprof] %6.3f ms %5.1f%%  %s", ms, 100 * ms / (total > 0 ? total : 1), gp_label[i]);
+            if (gp_draws[i]) LOG(", %u draws", gp_draws[i]);
+            if (gp_clears[i]) LOG(", %u clears (%u full-area first)", gp_clears[i], gp_clears_first[i]);
+            LOG("\n");
         }
     }
     gp_n = 0;
@@ -675,6 +696,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     vk_cmd();  // (an empty main buffer still carries the semaphores)
     s->ts_skip = wait != VK_NULL_HANDLE;
     if (s->ts_win && !s->ts_skip) s->ts_win = false;  // (not the window image's after all: counted as game work)
+    gp_mark(s->main, "(submission end: the GPU idle until the next one starts)");
     if (s->ts) rec_CmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 3 + 1);
     rec_EndCommandBuffer(s->main);
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
@@ -1536,6 +1558,11 @@ void vk_exec_init(void) {
     bool flat_auto = g_vk.props.vendorID != 0x1002;
 #endif
     maxwell_flat_default = fcs != GPU_AUTO ? fcs == GPU_ON : flat_auto;
+#ifdef __ANDROID__
+    // loops kept straight-line too (translate.c glsl_flatten, LARECOMP_SHADER_FLAT=2): Thor / Adreno 740 + Turnip 27,
+    // Lumiose street walk, GPU 15.6 -> 12.4 ms a frame (p95 19.0 -> 14.3; the three culling dispatches 3.6 -> 0.5 ms)
+    if (maxwell_flat_default) maxwell_flat_default = 2;
+#endif
     VkPhysicalDeviceSubgroupProperties sg = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
     VkPhysicalDeviceProperties2 pr2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &sg};
     vkGetPhysicalDeviceProperties2(g_vk.phys, &pr2);
@@ -1858,7 +1885,16 @@ void vk_end_pass(void) { vk_end_pass_at(0); }
 static void vk_end_pass_at(int line) {
     if (!in_pass) return;
     if (prof && line < 4096) prof_end_line[line]++;
-    rec_CmdEndRendering(vk_cmd());
+    bool keep = true;
+    if (pass_pending) {  // (lazy: nothing recorded in it - begun only if it clears something)
+        keep = false;
+        for (uint32_t i = 0; i < pend_ri.colorAttachmentCount; i++)
+            keep |= pend_ca[i].imageView && pend_ca[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+        keep |= pend_ri.pDepthAttachment && pend_da.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+        keep |= pend_ri.pStencilAttachment && pend_sa.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR;
+        if (!keep) pass_pending = false, lazy_stat[0]++;
+    }
+    if (keep) rec_CmdEndRendering(vk_cmd());
     in_pass = false;
     if (g_debug_frame && !probe_busy && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
         char path[256];
@@ -2289,6 +2325,11 @@ static void begin_pass(void) {
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {minw, minh}}, .layerCount = pass_layers,
                           .colorAttachmentCount = pass_ncolor, .pColorAttachments = pass_ncolor ? ca : NULL,
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
+    if (g_gpuprof_frame && gp_n) {  // (the pass's row: area, layers, attachments, load ops)
+        size_t l = strlen(gp_label[gp_n - 1]);
+        snprintf(gp_label[gp_n - 1] + l, sizeof gp_label[0] - l, " [%ux%u ly %u nc %u dl %d cl %d]", minw, minh, pass_layers,
+                 pass_ncolor, has_d ? (int)da.loadOp : -1, pass_ncolor ? (int)ca[0].loadOp : -1);
+    }
     // LARECOMP_VK_LOG_PASSES=<n> (default 300 with =1): each of the first n passes before it begins - an Intel crash
     // inside vkCmdBeginRendering (issues #8, #46) ends the log on the pass the driver choked on
     static long log_passes = -1;
@@ -2316,7 +2357,19 @@ static void begin_pass(void) {
         else LOG(", no depth / stencil");
         LOG(", samples %u\n", pass_samples);
     }
-    rec_CmdBeginRendering(cb, &ri);
+    if (lazy_pass < 0) {
+        const char *e = getenv("LARECOMP_VK_LAZY_PASS");
+        lazy_pass = e ? atoi(e) != 0 : 0;
+        LOG("[vk] lazy render passes (clears as load ops, empty passes dropped): %s\n", lazy_pass ? "on" : "off");
+    }
+    if (lazy_pass) {
+        pend_ri = ri;
+        memcpy(pend_ca, ca, sizeof ca[0] * pass_ncolor);
+        pend_da = da, pend_sa = sa;
+        pass_pending = true;
+        if (!(stat_passes & 0x3FFF)) LOG("[vk] lazy passes: %llu dropped, %llu clears as load ops, %llu begun\n",
+                                         (unsigned long long)lazy_stat[0], (unsigned long long)lazy_stat[1], (unsigned long long)lazy_stat[2]);
+    } else rec_CmdBeginRendering(cb, &ri);
     ss_forget();  // (whatever ran between the passes may have set its own state)
     in_pass = true;
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
@@ -2520,12 +2573,30 @@ static VkPipeline clear_pipeline(int index, int kind, uint32_t mask, bool depth,
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil, uint32_t sval,
                   uint32_t smask) {
     begin_pass();
-    VkCommandBuffer cb = vk_cmd();
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     VkRect2D rect = scissor_rect();
     if (!rect.extent.width || !rect.extent.height) return;
     if (index >= 0 && (index >= (int)pass_ncolor || pass_color[index] == VK_FORMAT_UNDEFINED)) return;
+    if (g_gpuprof_frame && gp_n) {
+        gp_clears[gp_n - 1]++;
+        if (!gp_draws[gp_n - 1] && !rect.offset.x && !rect.offset.y && rect.extent.width >= pass_w && rect.extent.height >= pass_h)
+            gp_clears_first[gp_n - 1]++;
+    }
     bool simple = (index < 0 || (mask & 0xF) == 0xF) && (!stencil || (smask & 0xFF) == 0xFF);
+    // (lazy passes: nothing recorded in the pass yet and the whole render area - the attachments' load op)
+    if (simple && pass_pending && !rect.offset.x && !rect.offset.y && rect.extent.width == pend_ri.renderArea.extent.width &&
+        rect.extent.height == pend_ri.renderArea.extent.height) {
+        if (index >= 0) {
+            pend_ca[index].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            memcpy(pend_ca[index].clearValue.color.float32, color, 16);
+        }
+        if (depth && pend_ri.pDepthAttachment) pend_da.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, pend_da.clearValue.depthStencil.depth = dval;
+        if (stencil && pend_ri.pStencilAttachment)
+            pend_sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, pend_sa.clearValue.depthStencil.stencil = sval;
+        lazy_stat[1]++;
+        return;
+    }
+    VkCommandBuffer cb = vk_cmd();
     if (simple) {
         VkClearAttachment a[2];
         uint32_t n = 0;
@@ -6778,6 +6849,7 @@ bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlo
         if (PREP_GET(prep_cs, ck)) return true;
         CsProg *cp = calloc(1, sizeof *cp);
         cp->code = r->vs;  // (prepared: its content hash, for the build logs)
+        if (ENV("LARECOMP_SAVE_BLOB")) LOG("[mxb] prepared cs %llx at %p\n", (unsigned long long)r->vs, (const void *)vsb->code);
         memcpy(cp->local, r->local, sizeof cp->local);
         if (!translate_compute(cp, vsb->code, vsb->const_offset ? vsb->const_offset : 0x10000, 0)) return false;
         PREP_PUT(prep_cs, ck, cp);
@@ -6805,6 +6877,9 @@ bool renderer_prepare(const ShaderRec *r, const ShaderBlob *vsb, const ShaderBlo
         p->fkey = fkey;
         p->prep_vh = r->vs, p->prep_fh = r->fs;
         p->hash[0] = r->vs, p->hash[1] = r->fs;
+        if (ENV("LARECOMP_SAVE_BLOB"))  // (translate.c save_blob names the files by address: which prepared shaders they are)
+            LOG("[mxb] prepared vs %llx at %p, fs %llx at %p\n", (unsigned long long)r->vs, (const void *)vsb->code,
+                (unsigned long long)r->fs, (const void *)fsb->code);
         bool ok = translate_program_now(p);
         p->code[0] = p->code[1] = 0;  // (the game files' copies are gone after this call)
         PREP_PUT(prep_progs, ck, p);  // (failed ones too: the game then skips them as it would its own)
@@ -7007,8 +7082,8 @@ static void dispatch_compute_(uint32_t gx, uint32_t gy, uint32_t gz) {
     vk_end_pass();
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
-    gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
-            (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
+    gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u) cs %llx gmem %d code %llx", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2],
+            (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem, (unsigned long long)cp->code);
     dl_note("dispatch %ux%ux%u cs %llx gmem %d", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
     if (dl_on > 0) vk_checkpoint(cb, dl_n);
     nfeedback = 0;
@@ -8187,7 +8262,8 @@ static void draw_(CmdRec *r, bool indexed) {
     if (g_gpuprof_frame && gp_n) {
         if (!gp_draws[gp_n - 1]) {  // first draw of the row: its fragment shader hash
             size_t l = strlen(gp_label[gp_n - 1]);
-            snprintf(gp_label[gp_n - 1] + l, sizeof gp_label[0] - l, ", first fs %016llx", (unsigned long long)g_cur_fs_hash);
+            snprintf(gp_label[gp_n - 1] + l, sizeof gp_label[0] - l, ", first fs %016llx code %llx %llx", (unsigned long long)g_cur_fs_hash,
+                     (unsigned long long)(pr->code[0] ? pr->code[0] : pr->prep_vh), (unsigned long long)(pr->code[1] ? pr->code[1] : pr->prep_fh));
         }
         gp_draws[gp_n - 1]++;
     }

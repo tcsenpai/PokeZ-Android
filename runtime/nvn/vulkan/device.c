@@ -2290,10 +2290,14 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
     frames++;
     static long shot_every = -1;
     if (shot_every < 0) { const char *e = getenv("LARECOMP_SCREENSHOT_EVERY"); shot_every = e ? atol(e) : 0; }
-    {   // LARECOMP_GPUPROF_AT=<frame>[,<frame>...]: GPU time per pass of those frames ("[gpuprof]" in the log)
+    {   // LARECOMP_GPUPROF_AT=<frame>[,<frame>...]: GPU time per pass of those frames ("[gpuprof]" in the log);
+        // LARECOMP_GPUPROF_EVERY=<n>: also every n-th frame (per-pass averages over a run)
         extern bool g_gpuprof_frame;
         extern void vk_gpuprof_report(void);
         if (g_gpuprof_frame) { g_gpuprof_frame = false; vk_gpuprof_report(); }
+        static long every = -1;
+        if (every < 0) { const char *v = getenv("LARECOMP_GPUPROF_EVERY"); every = v ? atol(v) : 0; }
+        if (every > 0 && (long)frame % every == 0) g_gpuprof_frame = true;
         const char *e = getenv("LARECOMP_GPUPROF_AT");
         for (const char *p = e; p && *p;) {
             long at = strtol(p, (char **)&p, 10);

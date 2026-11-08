@@ -17,6 +17,7 @@
 #include <malloc.h>  // alloca
 #else
 #include <sys/stat.h>  // mkdir
+#include <unistd.h>  // write (save_blob)
 #endif
 #include <dirent.h>
 #include <math.h>
@@ -30,7 +31,7 @@
 uint64_t maxwell_gmem_base, maxwell_gmem_size;
 uint32_t maxwell_gmem_chunk_shift;  // 0: one buffer for the whole heap (GLSL; shader.h)
 bool maxwell_gmem_lazy;
-bool maxwell_flat_default = true;
+int maxwell_flat_default = 1;
 bool maxwell_quad_ops;  // (vk_exec_init: the device has quad subgroup operations in fragment shaders)
 bool maxwell_gmem_fs_miss;
 bool maxwell_int64 = true;  // (vk_exec_init: false without shaderInt64 - 32-bit pairs in the GLSL, shader.h)
@@ -2375,11 +2376,17 @@ static bool glsl_early_tests(const Ctx *c) {
 // forward, the stacks are resolved here, at translation time (each SYNC / BRK gets the one target every path to it
 // agrees on), and the dispatcher becomes straight-line code: one variable, tgt, holds the address being skipped to
 // (0: running); each run of code is guarded by tgt == 0, each branch target clears it on arrival. An EXIT, or a computed
-// branch to an address that isn't a target, leaves it set to the end. Anything else (loops: a backward branch, PCNT /
-// CONT, stacks that differ between paths, an unknown jump table) keeps the state machine. LARECOMP_SHADER_FLAT=0: off.
+// branch to an address that isn't a target, leaves it set to the end. With LARECOMP_SHADER_FLAT=2 loops are kept in
+// this form too: each backward branch (BRA, SYNC / BRK / CONT to a resolved target, a jump table entry) makes a
+// `do { ... } while (tgt == <header>)` around its target label and itself; regions that overlap without nesting
+// become one loop with several headers. A branch out of a loop sets tgt past it (the loop ends, the code after skips
+// on), a branch into one skips forward inside it, a backward one ends every inner loop and repeats its own (Pokémon
+// Z-A's culling compute 826ecaa3: 3 loops and the 16 + 16 stack variables of the state machine, 48 registers with
+// 99 / 822 spill stores / loads on Adreno 740). Anything else (stacks or the PCNT target differing between paths,
+// an unknown jump table) keeps the state machine. LARECOMP_SHADER_FLAT=0: off.
 // The input is the body after glsl_rewrite(); the patterns are the ones emit_insn() writes.
 typedef struct { int kind; uint32_t arg; int guard; size_t line; } FlatTok;  // guard: line index of its `if (..) {`, or -1
-enum { FT_LINE, FT_LABEL, FT_PUSH_SSY, FT_PUSH_PBK, FT_POP_SSY, FT_POP_PBK, FT_BRA, FT_BRX, FT_EXIT };
+enum { FT_LINE, FT_LABEL, FT_PUSH_SSY, FT_PUSH_PBK, FT_POP_SSY, FT_POP_PBK, FT_BRA, FT_BRX, FT_EXIT, FT_PCNT, FT_CONT };
 
 static const char *skip_sp(const char *s) { while (*s == ' ') s++; return s; }
 static bool starts(const char *s, const char *p) { return !strncmp(s, p, strlen(p)); }
@@ -2394,6 +2401,12 @@ static int flat_kind(const char *l, uint32_t *arg) {
     if (starts(s, "pc = pbk_0;")) return FT_POP_PBK;
     if (starts(s, "{ uint t = ") && strstr(s, "; pc = t; continue; }")) return FT_BRX;
     if (starts(s, "exit_now = true; break;")) return FT_EXIT;
+    if (starts(s, "pc = pcnt_0; continue;") && !s[22]) return FT_CONT;
+    if (starts(s, "pcnt_0 = ") && s[9] >= '0' && s[9] <= '9') {
+        char *e;
+        *arg = (uint32_t)strtoul(s + 9, &e, 10);
+        if (!strcmp(e, "u;")) return FT_PCNT;
+    }
     if (starts(s, "pc = ") && s[5] >= '0' && s[5] <= '9') {
         char *e;
         *arg = (uint32_t)strtoul(s + 5, &e, 10);
@@ -2412,9 +2425,16 @@ static bool flat_fail(const char *why) {
     return false;
 }
 
+static int maxwell_flat_on(void);
 // body -> *out (the straight-line form, without the tgt declaration); false: keep the state machine
 static bool glsl_flatten(Ctx *c, const char *body, Str *out) {
     if (c->brx_unknown) return flat_fail("a computed branch without a known table");
+    if (getenv("LARECOMP_SHADER_FLAT_LOG"))
+        for (int b = 0; b < c->nbrx; b++) {
+            fprintf(stderr, "[flat] BRX at %u:", c->brx_pc[b]);
+            for (int q = 0; q < c->brx_ntgt[b]; q++) fprintf(stderr, " %u", c->brx_tgt[b][q]);
+            fprintf(stderr, "\n");
+        }
     // lines
     size_t nl = 0, cap = 256;
     char **L = malloc(cap * sizeof *L);
@@ -2449,7 +2469,7 @@ static bool glsl_flatten(Ctx *c, const char *body, Str *out) {
             uint32_t a2 = 0;
             int k2 = flat_kind(L[i + 1], &a2);
             if (k2 < 0) { ok = false, why = L[i + 1]; break; }
-            if (k2 == FT_PUSH_SSY || k2 == FT_PUSH_PBK) { ok = false, why = "a guarded push"; break; }
+            if (k2 == FT_PUSH_SSY || k2 == FT_PUSH_PBK || k2 == FT_PCNT) { ok = false, why = "a guarded push"; break; }
             if (k2 != FT_LINE) {
                 T[nt++] = (FlatTok){k2, a2, (int)i, i + 1};
                 i += 2;
@@ -2463,17 +2483,28 @@ static bool glsl_flatten(Ctx *c, const char *body, Str *out) {
         if (depth < 0) { ok = false, why = "unbalanced braces"; }
     }
     if (ok && depth) ok = false, why = "unbalanced braces";
-    // the stacks along every path (forward branches only: each token is reached with one stack state)
+    // the stacks along every path (each token is reached with one stack state; a backward branch, with loops on, must
+    // come back to its label with the state that label already has)
+    bool loops = maxwell_flat_on() >= 2;
+    // One stack of SSY / PBK entries in push order (kind 0 SSY, 1 PBK), as the hardware keeps them: a SYNC / BRK goes
+    // to the topmost entry of its kind. With loops on it also drops every entry above it (a BRK out of an SSY region
+    // leaves no stale SSY entry behind, which made a loop's head reachable with two stacks); off, only that entry
+    // goes, as the state machine's two separate stacks do.
     enum { DMAX = 16 };
-    typedef struct { uint8_t seen, nssy, npbk; uint32_t ssy[DMAX], pbk[DMAX]; } St;
+    typedef struct { uint8_t seen, n; uint8_t kind[DMAX]; uint32_t pcnt, tgt[DMAX]; } St;
     St *S = ok ? calloc(nt + 1, sizeof *S) : NULL;
     uint32_t *res = ok ? calloc(nt + 1, sizeof *res) : NULL;  // a pop's resolved target (0: never reached)
     size_t *lab = NULL;  // token index of each label, by search
     typedef struct { size_t k; St st; } Work;
     size_t nw = 0, wcap = 64;
     Work *W = ok ? malloc(wcap * sizeof *W) : NULL;
+    typedef struct { size_t s, e; int nh; uint32_t h[8]; } Loop;  // tokens s (a header label) .. e (a backward branch)
+    size_t nlp = 0, lcap = 0;
+    Loop *LP = NULL;
 #define LABEL_TOK(addr, outk) do { outk = (size_t)-1; for (size_t q_ = 0; q_ < nt; q_++) if (T[q_].kind == FT_LABEL && T[q_].arg == (addr)) { outk = q_; break; } } while (0)
 #define PUSH_WORK(kk, ss) do { if (nw == wcap) W = realloc(W, (wcap *= 2) * sizeof *W); W[nw].k = (kk); W[nw].st = (ss); nw++; } while (0)
+#define BACK_EDGE(hk, bk) do { if (nlp == lcap) LP = realloc(LP, (lcap = lcap ? lcap * 2 : 8) * sizeof *LP); \
+        LP[nlp++] = (Loop){(hk), (bk), 1, {T[hk].arg}}; } while (0)
     if (ok) { St s0 = {0}; PUSH_WORK(0, s0); }
     while (ok && nw) {
         Work w = W[--nw];
@@ -2481,9 +2512,14 @@ static bool glsl_flatten(Ctx *c, const char *body, Str *out) {
         St st = w.st;
         for (; k < nt && ok; k++) {
             if (S[k].seen) {
-                if (S[k].nssy != st.nssy || S[k].npbk != st.npbk || memcmp(S[k].ssy, st.ssy, sizeof st.ssy[0] * st.nssy) ||
-                    memcmp(S[k].pbk, st.pbk, sizeof st.pbk[0] * st.npbk))
+                if (S[k].n != st.n || S[k].pcnt != st.pcnt || memcmp(S[k].kind, st.kind, st.n) ||
+                    memcmp(S[k].tgt, st.tgt, sizeof st.tgt[0] * st.n)) {
                     ok = false, why = "the stacks differ between paths";
+                    if (getenv("LARECOMP_SHADER_FLAT_LOG"))  // (which token, and the two states: depth, top entry, pcnt)
+                        fprintf(stderr, "[flat] token %zu (line %zu: %s): depth %u/%u top %c%u/%c%u, pcnt %u/%u\n", k, T[k].line,
+                                L[T[k].line], S[k].n, st.n, S[k].n && S[k].kind[S[k].n - 1] ? 'B' : 'S', S[k].n ? S[k].tgt[S[k].n - 1] : 0,
+                                st.n && st.kind[st.n - 1] ? 'B' : 'S', st.n ? st.tgt[st.n - 1] : 0, S[k].pcnt, st.pcnt);
+                }
                 break;
             }
             S[k] = st;
@@ -2491,29 +2527,43 @@ static bool glsl_flatten(Ctx *c, const char *body, Str *out) {
             FlatTok *t = &T[k];
             bool cond = t->guard >= 0;
             if (t->kind == FT_PUSH_SSY || t->kind == FT_PUSH_PBK) {
-                uint32_t *a = t->kind == FT_PUSH_SSY ? st.ssy : st.pbk;
-                uint8_t *n = t->kind == FT_PUSH_SSY ? &st.nssy : &st.npbk;
-                if (*n == DMAX) { ok = false, why = "stack depth"; break; }
-                memmove(a + 1, a, *n * sizeof *a);
-                a[0] = t->arg;
-                (*n)++;
-            } else if (t->kind == FT_POP_SSY || t->kind == FT_POP_PBK || t->kind == FT_BRA) {
+                if (st.n == DMAX) { ok = false, why = "stack depth"; break; }
+                st.kind[st.n] = t->kind == FT_PUSH_PBK, st.tgt[st.n] = t->arg;
+                st.n++;
+            } else if (t->kind == FT_PCNT) {
+                if (!loops) { ok = false, why = "a PCNT (a loop)"; break; }
+                st.pcnt = t->arg;
+            } else if (t->kind == FT_POP_SSY || t->kind == FT_POP_PBK || t->kind == FT_BRA || t->kind == FT_CONT) {
                 St nx = st;
                 uint32_t to;
                 if (t->kind == FT_BRA) to = t->arg;
-                else {
-                    uint32_t *a = t->kind == FT_POP_SSY ? nx.ssy : nx.pbk;
-                    uint8_t *n = t->kind == FT_POP_SSY ? &nx.nssy : &nx.npbk;
-                    if (!*n) { ok = false, why = "a pop of an empty stack"; break; }
-                    to = a[0];
-                    memmove(a, a + 1, (*n - 1) * sizeof *a);
-                    (*n)--;
+                else if (t->kind == FT_CONT) {
+                    if (!st.pcnt) { ok = false, why = "a CONT without its PCNT"; break; }
+                    to = st.pcnt;
+                    if (res[k] && res[k] != to) { ok = false, why = "a CONT with two targets"; break; }
+                    res[k] = to;
+                } else {
+                    uint8_t want = t->kind == FT_POP_PBK;
+                    int j = nx.n - 1;
+                    while (j >= 0 && nx.kind[j] != want) j--;
+                    if (j < 0) { ok = false, why = "a pop of an empty stack"; break; }
+                    to = nx.tgt[j];
+                    if (loops) nx.n = (uint8_t)j;
+                    else {
+                        memmove(nx.kind + j, nx.kind + j + 1, nx.n - j - 1);
+                        memmove(nx.tgt + j, nx.tgt + j + 1, (nx.n - j - 1) * sizeof nx.tgt[0]);
+                        nx.n--;
+                    }
                     if (res[k] && res[k] != to) { ok = false, why = "a pop with two targets"; break; }
                     res[k] = to;
                 }
                 size_t tk;
                 LABEL_TOK(to, tk);
-                if (tk == (size_t)-1 || tk <= k) { ok = false, why = "a backward branch (a loop)"; break; }
+                if (tk == (size_t)-1) { ok = false, why = "a branch to no label"; break; }
+                if (tk <= k) {
+                    if (!loops) { ok = false, why = "a backward branch (a loop)"; break; }
+                    BACK_EDGE(tk, k);
+                }
                 PUSH_WORK(tk, nx);
                 if (!cond) break;
             } else if (t->kind == FT_BRX) {
@@ -2527,10 +2577,16 @@ static bool glsl_flatten(Ctx *c, const char *body, Str *out) {
                 for (int q = 0; q < c->brx_ntgt[b] && ok; q++) {
                     // (inside a PBK region the table's targets are its cases, before the break target: an entry past
                     // that is the word after the table, read as one more - brx_table_labels)
-                    if (st.npbk && c->brx_tgt[b][q] >= st.pbk[0]) continue;
+                    int j = st.n - 1;
+                    while (j >= 0 && !st.kind[j]) j--;
+                    if (j >= 0 && c->brx_tgt[b][q] >= st.tgt[j]) continue;
                     size_t tk;
                     LABEL_TOK(c->brx_tgt[b][q], tk);
-                    if (tk == (size_t)-1 || tk <= k) { ok = false, why = "a computed branch backward"; break; }
+                    if (tk == (size_t)-1) { ok = false, why = "a computed branch to no label"; break; }
+                    if (tk <= k) {
+                        if (!loops) { ok = false, why = "a computed branch backward"; break; }
+                        BACK_EDGE(tk, k);
+                    }
                     PUSH_WORK(tk, st);
                 }
                 if (!cond) break;
@@ -2539,22 +2595,53 @@ static bool glsl_flatten(Ctx *c, const char *body, Str *out) {
             }
         }
     }
-    // emit: runs of code under `if (tgt == 0u)`, each label clearing tgt
+    // loops: regions that overlap without one holding the other, or that share their header, become one
+    for (bool merged = true; ok && merged;) {
+        merged = false;
+        for (size_t i = 0; i < nlp && !merged; i++)
+            for (size_t j = i + 1; j < nlp && !merged; j++) {
+                Loop *a = &LP[i], *b = &LP[j];
+                if (a->e < b->s || b->e < a->s) continue;
+                bool nested = (a->s <= b->s && b->e <= a->e) || (b->s <= a->s && a->e <= b->e);
+                if (nested && a->s != b->s) continue;
+                if (b->s < a->s) a->s = b->s;
+                if (b->e > a->e) a->e = b->e;
+                for (int q = 0; q < b->nh && ok; q++) {
+                    bool have = false;
+                    for (int r = 0; r < a->nh; r++) have |= a->h[r] == b->h[q];
+                    if (have) continue;
+                    if (a->nh == 8) { ok = false, why = "a loop with too many headers"; break; }
+                    a->h[a->nh++] = b->h[q];
+                }
+                LP[j] = LP[--nlp];
+                merged = true;
+            }
+    }
+    // (outer first: by start, then the longer one)
+    for (size_t i = 1; i < nlp; i++)
+        for (size_t j = i; j > 0 && (LP[j].s < LP[j - 1].s || (LP[j].s == LP[j - 1].s && LP[j].e > LP[j - 1].e)); j--) {
+            Loop x = LP[j]; LP[j] = LP[j - 1]; LP[j - 1] = x;
+        }
+    // emit: runs of code under `if (tgt == 0u)`, each label clearing tgt; each loop a do / while around its region
+    // (lguard: a bound on backward branches, as the state machine's guard on its steps - a GPU that never stops hangs)
     if (ok) {
         bool open = false;
 #define CLOSE() do { if (open) { sp(out, "  }\n"); open = false; } } while (0)
 #define OPEN() do { if (!open) { sp(out, "  if (tgt == 0u) {\n"); open = true; } } while (0)
+        if (nlp) sp(out, "  uint lguard = 0u;\n");
         for (size_t k = 0; k < nt; k++) {
             FlatTok *t = &T[k];
+            for (size_t i = 0; i < nlp; i++)
+                if (LP[i].s == k) { CLOSE(); sp(out, "  do {\n"); }
             switch (t->kind) {
             case FT_LABEL: CLOSE(); sp(out, "  if (tgt == %uu) tgt = 0u;\n", t->arg); break;
-            case FT_PUSH_SSY: case FT_PUSH_PBK: break;
+            case FT_PUSH_SSY: case FT_PUSH_PBK: case FT_PCNT: break;
             case FT_LINE: OPEN(); sp(out, "%s\n", L[t->line]); break;
             default: {
                 OPEN();
                 if (t->guard >= 0) sp(out, "%s\n", L[t->guard]);
                 if (t->kind == FT_BRA) sp(out, "    tgt = %uu;\n", t->arg);
-                else if (t->kind == FT_POP_SSY || t->kind == FT_POP_PBK) {
+                else if (t->kind == FT_POP_SSY || t->kind == FT_POP_PBK || t->kind == FT_CONT) {
                     if (res[k]) sp(out, "    tgt = %uu;\n", res[k]);
                     else sp(out, "    tgt = 0xFFFFFFFFu;\n");  // (never reached)
                 } else if (t->kind == FT_BRX) {
@@ -2566,6 +2653,13 @@ static bool glsl_flatten(Ctx *c, const char *body, Str *out) {
                 CLOSE();
             }
             }
+            for (size_t i = nlp; i-- > 0;)
+                if (LP[i].e == k) {
+                    CLOSE();
+                    sp(out, "  } while ((");
+                    for (int q = 0; q < LP[i].nh; q++) sp(out, "%stgt == %uu", q ? " || " : "", LP[i].h[q]);
+                    sp(out, ") && ++lguard < 100000u);\n");
+                }
         }
         CLOSE();
 #undef CLOSE
@@ -2575,15 +2669,17 @@ static bool glsl_flatten(Ctx *c, const char *body, Str *out) {
     }
 #undef LABEL_TOK
 #undef PUSH_WORK
+#undef BACK_EDGE
     for (size_t i = 0; i < nl; i++) free(L[i]);
-    free(L), free(T), free(S), free(res), free(W), free(lab);
+    free(L), free(T), free(S), free(res), free(W), free(lab), free(LP);
     return ok;
 }
 
-// the straight-line form on? LARECOMP_SHADER_FLAT=0/1, else the runtime's default (shader.h maxwell_flat_default)
+// the straight-line form on? LARECOMP_SHADER_FLAT=0/1/2 (2: loops too), else the runtime's default (shader.h
+// maxwell_flat_default)
 static int maxwell_flat_on(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("LARECOMP_SHADER_FLAT"); on = e ? atoi(e) != 0 : maxwell_flat_default; }
+    if (on < 0) { const char *e = getenv("LARECOMP_SHADER_FLAT"); on = e ? atoi(e) : maxwell_flat_default; }
     return on;
 }
 
@@ -2894,35 +2990,41 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
 // are read until one isn't an instruction of this shader (the end of the table; a word past it that still looks like
 // one only adds a harmless case). False: not that shape (the register set some other way, no constants, nothing
 // valid) - the caller labels every instruction as before. LARECOMP_BRX_ALL_LABELS=1: always every instruction.
-static bool brx_table_labels(const uint8_t *code, size_t i, size_t end, const uint8_t *blob, size_t const_offset, uint8_t *label,
-                             uint32_t *tgts, int *ntgts) {
-    static int all = -1;
-    if (all < 0) { const char *e = getenv("LARECOMP_BRX_ALL_LABELS"); all = e && atoi(e) != 0; }
-    if (all || const_offset >= 0x10000 || const_offset < 0x80) return false;  // (0x10000: no constants known)
+// The table's offset in cb1 (from the LDC that loads the BRX register), or -1: not that shape.
+static int64_t brx_table_off(const uint8_t *code, size_t i) {
     uint64_t brx = ((const uint64_t *)code)[i];
     int ra = (int)bits(brx, 8, 8);
-    int64_t imm = sbits(brx, 20, 24);
-    if (ra == RZ) return false;
+    if (ra == RZ) return -1;
     // the instruction that set ra: an LDC from cb1 within the few before, nothing else writing ra (or a branch) between
-    int64_t table = -1;
     for (size_t k = i, seen = 0; k-- > 0 && seen < 32;) {
         if (k % 4 == 0) continue;  // (scheduling words)
         seen++;
         uint64_t w = ((const uint64_t *)code)[k];
         if ((w & 0xfff0000000000000ull) >= 0xe200000000000000ull && (w & 0xfff0000000000000ull) <= 0xe350000000000000ull)
-            return false;  // flow control between: not straight-line
+            return -1;  // flow control between: not straight-line
         if ((w & 0xfff8000000000000ull) == 0xef90000000000000ull && (int)bits(w, 0, 8) == ra) {  // LDC ra, c[idx][Rx + off]
-            if (bits(w, 36, 5) != 1 || bits(w, 48, 3) != 4) return false;  // (cb1, 32-bit)
-            table = (int64_t)bits(w, 20, 16);
-            break;
+            if (bits(w, 36, 5) != 1 || bits(w, 48, 3) != 4) return -1;  // (cb1, 32-bit)
+            return (int64_t)bits(w, 20, 16);
         }
-        if ((int)bits(w, 0, 8) == ra) return false;  // (something else may write ra: unknown)
+        if ((int)bits(w, 0, 8) == ra) return -1;  // (something else may write ra: unknown)
     }
+    return -1;
+}
+
+// max_entries: where the next BRX's table starts (the compiler lays them out one after another, so a table read
+// "until a word isn't an instruction" ran on through every later one: their cases became this BRX's targets too)
+static bool brx_table_labels(const uint8_t *code, size_t i, size_t end, const uint8_t *blob, size_t const_offset, uint8_t *label,
+                             uint32_t *tgts, int *ntgts, size_t max_entries) {
+    static int all = -1;
+    if (all < 0) { const char *e = getenv("LARECOMP_BRX_ALL_LABELS"); all = e && atoi(e) != 0; }
+    if (all || const_offset >= 0x10000 || const_offset < 0x80) return false;  // (0x10000: no constants known)
+    int64_t imm = sbits(((const uint64_t *)code)[i], 20, 24);
+    int64_t table = brx_table_off(code, i);
     if (table < 0) return false;
     const uint8_t *tab = blob + const_offset + table;
     uint8_t *mark = calloc(end + 4, 1);
     int n = 0;
-    for (int k = 0; k < 256; k++) {
+    for (int k = 0; k < 256 && (size_t)k < max_entries; k++) {
         int32_t v;
         memcpy(&v, tab + 4 * k, 4);
         int64_t t = (int64_t)i * 8 + 8 + v + imm;
@@ -2980,6 +3082,15 @@ static ShaderInfo *translate(const uint8_t *blob, size_t max_size, int stage, co
     uint8_t *label = calloc(end + 4, 1);
     label[1] = 1;
     bool any_branch = false;
+    // (LARECOMP_SHADER_FLAT=2) every BRX's table offset: each table ends where the next one starts (brx_table_labels)
+    int64_t brx_tabs[64];
+    int nbrx_tabs = 0;
+    if (c->glsl && maxwell_flat_on() >= 2)
+        for (size_t i = 0; i < end && nbrx_tabs < 64; i++)
+            if (i % 4 && (((const uint64_t *)code)[i] & 0xfff0000000000000ull) == 0xe250000000000000ull) {
+                int64_t t = brx_table_off(code, i);
+                if (t >= 0) brx_tabs[nbrx_tabs++] = t;
+            }
     for (size_t i = 0; i < end; i++) {
         if (i % 4 == 0) continue;
         uint64_t w = ((const uint64_t *)code)[i];
@@ -2999,7 +3110,11 @@ static ShaderInfo *translate(const uint8_t *blob, size_t max_size, int stage, co
             if (c->glsl && c->nbrx < 32) {
                 int k = c->nbrx;
                 c->brx_pc[k] = (uint32_t)(i * 8), c->brx_ntgt[k] = 0;
-                known = brx_table_labels(code, i, end, blob, max_size, label, c->brx_tgt[k], &c->brx_ntgt[k]);
+                size_t max_entries = 256;
+                int64_t own = brx_table_off(code, i);
+                for (int q = 0; own >= 0 && q < nbrx_tabs; q++)
+                    if (brx_tabs[q] > own && (size_t)(brx_tabs[q] - own) / 4 < max_entries) max_entries = (size_t)(brx_tabs[q] - own) / 4;
+                known = brx_table_labels(code, i, end, blob, max_size, label, c->brx_tgt[k], &c->brx_ntgt[k], max_entries);
                 if (known && c->brx_ntgt[k] < 64) c->nbrx++;
                 else known = false;
             }
@@ -3314,7 +3429,53 @@ static void cache_store(uint64_t h, const ShaderInfo *info) {
     if (!ok || rename(tmp, path) != 0) remove(tmp);  // (written meanwhile by another thread: theirs is the same)
 }
 
+// (dev) LARECOMP_SAVE_BLOB=1: each translated shader's input - its code with the 64 KB after the code or max_size
+// (BRX jump tables are read from the constants past max_size), the key and the translator's globals - as
+// build/glsl/<code address>_<stage>.mxb, for an offline run of this translator (eval tools: mxb.c). The bytes go out
+// with write(): an unmapped page past the code ends the dump instead of faulting.
+static void save_blob(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
+    static int on = -1;
+    if (on < 0) on = getenv("LARECOMP_SAVE_BLOB") != NULL;
+    if (!on || !blob || !key) return;
+    char path[96];
+#ifndef _WIN32
+    mkdir("build", 0755), mkdir("build/glsl", 0755);
+#endif
+    const uint8_t *code = code_start(blob, stage);
+    uint64_t n = max_size, len = max_size;
+    if (max_size > (size_t)(code - blob)) {
+        len = (uint64_t)(code - blob) + code_end(blob, code, max_size) * 8;
+        if (len + 65536 < n) n = len + 65536;
+    }
+    // (named by the code's hash too: prepared shaders' blobs are freed, and a later one at the same address replaced it)
+    snprintf(path, sizeof path, "build/glsl/%llx_%016llx_%d.mxb", (unsigned long long)(uintptr_t)blob,
+             (unsigned long long)fnv(0xcbf29ce484222325ull, blob, (size_t)(len < n ? len : n)), stage);
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    uint64_t h[8] = {0x3142584dull /* MXB1 */, (uint64_t)stage, max_size, maxwell_gmem_base, maxwell_gmem_size,
+                     maxwell_gmem_chunk_shift,
+                     (uint64_t)maxwell_int64 | (uint64_t)maxwell_gmem_bda << 1 | (uint64_t)maxwell_quad_ops << 2 |
+                         (uint64_t)maxwell_gmem_lazy << 3 | (uint64_t)maxwell_gmem_fs_miss << 4,
+                     sizeof *key};
+    fwrite(h, sizeof h, 1, f);
+    fwrite(key, sizeof *key, 1, f);
+#ifdef _WIN32
+    fwrite(blob, 1, (size_t)n, f);
+#else
+    fflush(f);
+    n += 65536;
+    for (uint64_t o = 0; o < n;) {
+        size_t want = n - o < 4096 ? (size_t)(n - o) : 4096 - ((uintptr_t)(blob + o) & 4095);
+        ssize_t w = write(fileno(f), blob + o, want);
+        if (w <= 0) break;
+        o += (uint64_t)w;
+    }
+#endif
+    fclose(f);
+}
+
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
+    save_blob(blob, max_size, stage, key);
     uint64_t h = cache_key(blob, max_size, stage, key);
     ShaderInfo *info = h ? cache_load(h) : NULL;
     if (info) return info;

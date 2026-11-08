@@ -121,9 +121,10 @@ extern uint64_t maxwell_gmem_base, maxwell_gmem_size;
 // 0: one buffer.
 extern uint32_t maxwell_gmem_chunk_shift;
 extern bool maxwell_gmem_lazy;
-// The straight-line form of forward-only branches (glsl_flatten) unless LARECOMP_SHADER_FLAT says otherwise: the
-// runtime sets it before the first translation (Vulkan: off on AMD GPUs, exec.c vk_exec_init).
-extern bool maxwell_flat_default;
+// The straight-line form (glsl_flatten) unless LARECOMP_SHADER_FLAT says otherwise: 0 off, 1 forward branches only,
+// 2 loops too. The runtime sets it before the first translation (Vulkan: off on AMD GPUs, 2 on Android - exec.c
+// vk_exec_init).
+extern int maxwell_flat_default;
 extern bool maxwell_quad_ops;
 // GLSL with 64-bit integer types (carry chains, funnel shifts, global addresses) - true - or only 32-bit pairs with
 // explicit carries - false: a device without shaderInt64 (Qualcomm's own driver). Set before the first translation.
