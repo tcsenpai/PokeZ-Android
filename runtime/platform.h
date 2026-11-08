@@ -82,11 +82,16 @@ void plat_perf_hint(uint64_t work_ns, uint64_t target_ns);
 // The rate the window's content is made at (an SDL_Window; fps 0: no preference): the display's adaptive refresh
 // follows it instead of guessing from the presents
 void plat_frame_rate_hint(void *sdl_window, float fps);
+// The display's latest vsync (plat_now_ns clock) and its refresh period, as the compositor reports them (Android:
+// AChoreographer on a thread of its own, started by the first call); false while unknown. runtime/hle/vi.c locks the
+// game's vsync timer to it (LARECOMP_VSYNC_LOCK).
+bool plat_display_vsync(uint64_t *at_ns, uint64_t *period_ns);
 #else
 static inline void plat_perf_hint(uint64_t work_ns, uint64_t target_ns) { (void)work_ns, (void)target_ns; }
 static inline void plat_frame_rate_hint(void *sdl_window, float fps) { (void)sdl_window, (void)fps; }
 static inline double plat_thermal_scale(double now) { (void)now; return 1.0; }
 static inline int plat_thermal_throttled(void) { return 0; }
+static inline bool plat_display_vsync(uint64_t *at_ns, uint64_t *period_ns) { (void)at_ns, (void)period_ns; return false; }
 #endif
 
 // ---- process

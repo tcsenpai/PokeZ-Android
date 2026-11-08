@@ -152,12 +152,16 @@ int32_t rt_za_frame_cfg(int32_t cfg) {
     // 2, forced by pace.c's hold - over a 90 Hz vsync: each frame is 2/90 s of world and shown 22.2 ms apart, the same
     // speed and smoothness as a real 45 fps. A frame the GPU misses (over 22.2 ms) still steps 2: the world slows a
     // little instead of the 60 fps mode's cliff - and nothing retries, so it never oscillates. LARECOMP_FPS wins (tests).
+    // LARECOMP_FPS45_HZ=<hz>: that vsync instead of 90 - 80 makes it a 40 fps mode, each frame 25 ms = exactly three
+    // refreshes of a 120 Hz panel (the AYN Thor's top mode; 45 on it would alternate 2 and 3 refreshes).
     extern volatile uint64_t g_vsync_period_ns;  // runtime/hle/vi.c
     bool f45 = !e && g_settings.fps45;    static bool was45;
     if (f45 != was45) {
         was45 = f45;
-        g_vsync_period_ns = f45 ? 11111111 : 16666667;
-        LOG("[pace] 45 fps mode %s: a 90 Hz vsync, two world steps and a present every two\n", f45 ? "on" : "off");
+        const char *hz = ENV("LARECOMP_FPS45_HZ");
+        double v = hz && atof(hz) >= 40 && atof(hz) <= 240 ? atof(hz) : 90;
+        g_vsync_period_ns = f45 ? (uint64_t)(1e9 / v) : 16666667;
+        LOG("[pace] 45 fps mode %s: a %.0f Hz vsync, two world steps and a present every two\n", f45 ? "on" : "off", v);
     }
     extern bool g_fps45_hold;  // runtime/nvn/pace.c hold_30: forced on while in the mode
     g_fps45_hold = f45;

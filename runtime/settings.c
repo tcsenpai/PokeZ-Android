@@ -39,7 +39,13 @@ bool gpu_feature_on(int feature, const char *env) {
 
 Settings g_settings = {
     .aspect = ASPECT_UNLOCKED,
+#ifdef __ANDROID__
+    // (Android: immersive - no status / navigation bar, the swapchain the panel's whole 1920x1080 instead of 1920x970
+    // with a pillarboxed picture; SDL hides the bars for a fullscreen window)
+    .fullscreen = true,
+#else
     .fullscreen = false,
+#endif
     .volume = 1.0f,
     .reverb = true,
     .movie_audio = true,

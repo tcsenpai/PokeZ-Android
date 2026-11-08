@@ -53,6 +53,29 @@ public class ZARecompActivity extends SDLActivity {
 }
 JAVA
 
+# The launcher's icon starts this one, which starts the game on the main display: a dual-screen handheld (AYN Thor:
+# 1920x1080 top, 1080x1240 bottom) would otherwise open the game on whichever screen the launcher was tapped on.
+cat > "$APP/app/src/main/java/$PKGDIR/ZALaunchActivity.java" <<JAVA
+package $PKG;
+
+import android.app.Activity;
+import android.app.ActivityOptions;
+import android.content.Intent;
+import android.os.Bundle;
+import android.view.Display;
+
+/** No window of its own: the game's activity, on the default (top) display, then gone. */
+public class ZALaunchActivity extends Activity {
+    @Override
+    protected void onCreate(Bundle state) {
+        super.onCreate(state);
+        Intent i = new Intent(this, ZARecompActivity.class).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        startActivity(i, ActivityOptions.makeBasic().setLaunchDisplayId(Display.DEFAULT_DISPLAY).toBundle());
+        finish();
+    }
+}
+JAVA
+
 echo "=== manifest ==="
 cat > "$APP/app/src/main/AndroidManifest.xml" <<'XML'
 <?xml version="1.0" encoding="utf-8"?>
@@ -79,7 +102,15 @@ cat > "$APP/app/src/main/AndroidManifest.xml" <<'XML'
             android:launchMode="singleInstance"
             android:screenOrientation="sensorLandscape"
             android:preferMinimalPostProcessing="true"
-            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation">
+            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation" />
+
+        <activity
+            android:name=".ZALaunchActivity"
+            android:label="ZA Recomp"
+            android:exported="true"
+            android:noHistory="true"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.NoDisplay">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

@@ -12,15 +12,35 @@ volatile uint64_t g_vsync_count;  // vsyncs signalled so far (runtime/hle/framep
 volatile uint64_t g_vsync_ns;     // plat_now_ns() of the latest (stored after the count: count >= the vsync it's from)
 volatile uint64_t g_vsync_period_ns = 16666667;  // 60 Hz; framepace.c's 45 fps mode sets 90 Hz (11.1 ms)
 uint64_t g_native_window;
-
+// LARECOMP_VSYNC_LOCK=<us>: the timer follows the display's own vsync (platform.h plat_display_vsync: Android's
+// Choreographer), firing that many microseconds after it, its period an exact multiple of the display's - a free timer
+// drifts against the panel by its clock's ppm, and a held 30 fps frame then lands on a different refresh now and then.
+// Corrected by at most 0.25 ms a tick (no jumps). Unset: the free timer.
 static void *vsync_thread(void *arg) {
     (void)arg;
     uint64_t period = 16666667;  // (re-read each vsync: the 45 fps mode changes it on the fly)
     plat_thread_realtime(period);
     plat_thread_perf_core(PLAT_PERF_VSYNC);
+    const char *lk = getenv("LARECOMP_VSYNC_LOCK");
+    int64_t lock_off = lk && atoi(lk) > 0 ? (int64_t)atoi(lk) * 1000 : -1;
+    int locked_said = 0;
     uint64_t next = plat_now_ns();
     for (;;) {
         period = g_vsync_period_ns;
+        uint64_t at, dp;
+        if (lock_off >= 0 && plat_display_vsync(&at, &dp)) {
+            uint64_t r = (period + dp / 2) / dp;
+            int64_t miss = (int64_t)period - (int64_t)(r * dp);
+            if (r >= 1 && (miss < 0 ? -miss : miss) < (int64_t)period / 50) {  // (2%: the Thor's 60 Hz is 59.65)
+                period = r * dp;
+                int64_t d = (int64_t)(next + period - at), ph = ((d % (int64_t)dp) + (int64_t)dp) % (int64_t)dp - lock_off;
+                if (ph > (int64_t)dp / 2) ph -= (int64_t)dp;
+                if (ph < -(int64_t)dp / 2) ph += (int64_t)dp;
+                next -= ph > 250000 ? 250000 : ph < -250000 ? -250000 : ph;
+                if (!locked_said++) LOG("[vi] vsync locked to the display's: %.3f ms (%llu refreshes), %.2f ms after it\n",
+                                        period / 1e6, (unsigned long long)r, lock_off / 1e6);
+            }
+        }
         next += period;
         plat_sleep_until_ns(next);
         uint64_t now = plat_now_ns();
