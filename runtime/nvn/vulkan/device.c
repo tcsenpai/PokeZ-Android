@@ -147,6 +147,29 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
     return VK_FALSE;
 }
 
+#ifdef LARECOMP_VOLK
+#include <adrenotools/driver.h>
+#include <dlfcn.h>
+#include <libgen.h>
+// Thor experiment: Vulkan through Mesa Turnip (packaged as libvulkan_turnip.so beside libmain.so), loaded with
+// libadrenotools onto the system loader. LARECOMP_DRIVER=system: the phone's own driver (through volk as well).
+static void *custom_vulkan;
+static PFN_vkGetInstanceProcAddr custom_driver(void) {
+    const char *want = getenv("LARECOMP_DRIVER");
+    Dl_info di;
+    if ((want && !strcmp(want, "system")) || !dladdr((void *)custom_driver, &di) || !di.dli_fname) return NULL;
+    char dir[1100], drv[1200];
+    snprintf(dir, sizeof dir, "%s/", dirname(strdup(di.dli_fname)));
+    const char *name = want && *want ? want : "libvulkan_turnip.so";
+    snprintf(drv, sizeof drv, "%s%s", dir, name);
+    if (access(drv, R_OK) != 0) { LOG("[vk] driver %s: missing, the system's instead\n", drv); return NULL; }
+    custom_vulkan = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, NULL, dir, dir, name, NULL, NULL);
+    PFN_vkGetInstanceProcAddr gipa = custom_vulkan ? (PFN_vkGetInstanceProcAddr)dlsym(custom_vulkan, "vkGetInstanceProcAddr") : NULL;
+    LOG("[vk] driver %s: %s\n", drv, gipa ? "loaded (libadrenotools)" : "failed, the system's instead");
+    return gipa;
+}
+#endif
+
 static bool ab_inst_ext, ab_on;  // (GPU address binding report: below, after g_fault_ext)
 static void ab_messenger_create(void);
 // LARECOMP_VK_VALIDATION=1: Khronos validation layer (MSYS2 package vulkan-validation-layers)
@@ -156,6 +179,13 @@ static void ab_messenger_create(void);
 // slower): a run with _VALIDATION has them. A few fps. The layer must be found: VK_LAYER_PATH=C:\msys64\ucrt64\bin.
 static bool validating;  // the validation layer is on (validation_exit)
 static void create_instance(void) {
+#ifdef LARECOMP_VOLK
+    {
+        PFN_vkGetInstanceProcAddr gipa = custom_driver();
+        if (gipa) volkInitializeCustom(gipa);
+        else if (volkInitialize() != VK_SUCCESS) FATAL("volk: no Vulkan loader\n");
+    }
+#endif
     Uint32 n_sdl = 0;
     const char *const *sdl_ext = SDL_Vulkan_GetInstanceExtensions(&n_sdl);
     const char *ext[20];
@@ -208,6 +238,9 @@ static void create_instance(void) {
     }
     validating = validate;
     if (r != VK_SUCCESS) FATAL("vkCreateInstance: %d (is a Vulkan 1.3 driver installed?)\n", r);
+#ifdef LARECOMP_VOLK
+    volkLoadInstance(g_vk.inst);
+#endif
     if (validate && want_ab) ab_inst_ext = true;
     ab_messenger_create();
     if (validate) {
@@ -996,6 +1029,9 @@ static void create_device(void) {
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     if (ab_on) ab_feat.pNext = (void *)di.pNext, di.pNext = &ab_feat;
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
+#ifdef LARECOMP_VOLK
+    volkLoadDevice(g_vk.dev);
+#endif
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
 #define VK_LOAD_COMMAND(f)                                                                                            \
     if (!(vkp_##f = (PFN_##f)vkGetDeviceProcAddr(g_vk.dev, #f)))                                                     \
@@ -2413,6 +2449,14 @@ void ui_window_init(void) {
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
     if (g_settings.fullscreen && !ENV("LARECOMP_WINDOW") && !ENV("LARECOMP_HIDDEN")) SDL_SetWindowFullscreen(window, true);
     create_instance();
+#ifdef LARECOMP_VOLK
+    if (custom_vulkan) {  // (SDL's surface would come from its own copy of the system loader)
+        VkAndroidSurfaceCreateInfoKHR sci = {.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
+            .window = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL)};
+        if (!sci.window || vkCreateAndroidSurfaceKHR(g_vk.inst, &sci, NULL, &g_vk.surface) != VK_SUCCESS)
+            FATAL("vkCreateAndroidSurfaceKHR failed\n");
+    } else
+#endif
     if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
     pick_device();
     create_device();
@@ -2471,6 +2515,21 @@ static void window_event_log(const SDL_Event *e) {
     if (n++ < 300) LOG("[window] %s (t=%.1f)\n", what, SDL_GetTicks() / 1000.0);
 }
 
+// Thor experiment (EoWRecomp 48c12b4): on Android SDL_WaitEventTimeout never sleeps (each pump queues a sentinel that
+// wakes it at once), so the UI thread spins a big core. Poll, then sleep 4 ms. LARECOMP_UI_POLL=0: SDL's wait.
+static bool next_event(SDL_Event *e) {
+#ifdef __ANDROID__
+    static int poll = -1;
+    if (poll < 0) poll = !ENV("LARECOMP_UI_POLL") || atoi(ENV("LARECOMP_UI_POLL")) != 0;
+    if (poll) {
+        if (SDL_PollEvent(e)) return true;
+        SDL_DelayNS(4000000);
+        return false;
+    }
+#endif
+    return SDL_WaitEventTimeout(e, 16);
+}
+
 int ui_run(void) {
     ui_window_init();
     atomic_store(&ui_ready, true);
@@ -2479,7 +2538,7 @@ int ui_run(void) {
         SDL_Event e;
         atomic_store(&ui_beat, SDL_GetTicksNS());
         atomic_store(&ui_stage, "waiting for events");
-        while (SDL_WaitEventTimeout(&e, 16)) {
+        while (next_event(&e)) {
             input_rumble_poll();
             atomic_store(&ui_beat, SDL_GetTicksNS());
             window_event_log(&e);

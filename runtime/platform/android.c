@@ -358,7 +358,56 @@ int plat_cpu_count(void) {
     return sched_getaffinity(0, sizeof set, &set) == 0 ? CPU_COUNT(&set) : 0;
 }
 
-void plat_thread_guest(int prio) { (void)prio; }
+// ---- Thor experiment: core placement (LARECOMP_AFFINITY). Cores by top frequency: "fast" = the single fastest core
+// (8 Gen 2: cpu7, X3), "big" = the next tier (cpu3-6). =x3: the game's main thread alone on the fastest core, the
+// render thread on the big ones, every other guest thread off the fastest; =render: the other way round (EoWRecomp's
+// default); =big: game and render threads on fast + big; unset / 0: Android decides (as shipped).
+static cpu_set_t g_set_fast, g_set_big, g_set_notfast;
+static int g_aff_mode;  // 0 off, 1 x3, 2 render, 3 big
+static void aff_scan(void) {
+    const char *e = getenv("LARECOMP_AFFINITY");
+    g_aff_mode = !e || !*e || !strcmp(e, "0") ? 0 : !strcmp(e, "render") ? 2 : !strcmp(e, "big") ? 3 : 1;
+    if (!g_aff_mode) return;
+    long f[CPU_SETSIZE] = {0}, best = 0, second = 0;
+    int n = 0;
+    for (; n < CPU_SETSIZE; n++) {
+        char p[96];
+        snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", n);
+        FILE *fp = fopen(p, "r");
+        if (!fp) break;
+        if (fscanf(fp, "%ld", &f[n]) != 1) f[n] = 0;
+        fclose(fp);
+        if (f[n] > best) best = f[n];
+    }
+    for (int i = 0; i < n; i++) if (f[i] < best && f[i] > second) second = f[i];
+    CPU_ZERO(&g_set_fast), CPU_ZERO(&g_set_big), CPU_ZERO(&g_set_notfast);
+    for (int i = 0; i < n; i++) {
+        if (f[i] == best) CPU_SET(i, &g_set_fast); else CPU_SET(i, &g_set_notfast);
+        if (f[i] == second) CPU_SET(i, &g_set_big);
+    }
+    if (!CPU_COUNT(&g_set_fast) || !CPU_COUNT(&g_set_big)) g_aff_mode = 0;
+    fprintf(stderr, "[cpu] affinity mode %d: %d fastest core(s) %ld MHz, %d big %ld MHz\n", g_aff_mode,
+            CPU_COUNT(&g_set_fast), best / 1000, CPU_COUNT(&g_set_big), second / 1000);
+}
+static void aff_apply(const cpu_set_t *s, const char *who) {
+    if (sched_setaffinity(0, sizeof *s, s) != 0) fprintf(stderr, "[cpu] affinity for %s: %s\n", who, strerror(errno));
+}
+void plat_thread_guest(int prio) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    (void)prio;
+    pthread_once(&once, aff_scan);
+    if (g_aff_mode == 1 || g_aff_mode == 3) aff_apply(&g_set_notfast, "guest");
+}
+void plat_thread_perf_core(int role) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, aff_scan);
+    if (!g_aff_mode || role == PLAT_PERF_VSYNC) return;
+    cpu_set_t both = g_set_fast;
+    CPU_OR(&both, &both, &g_set_big);
+    bool game = role == PLAT_PERF_GAME;
+    const cpu_set_t *s = g_aff_mode == 3 ? &both : (g_aff_mode == 1) == game ? &g_set_fast : &g_set_big;
+    if (sched_setaffinity(0, sizeof *s, s) != 0) aff_apply(&both, game ? "game (fastest core parked: fast + big)" : "render");
+}
 
 // SCHED_FIFO needs a privilege an app never has, so in practice this is the setpriority path. Worth keeping: on a
 // phone the vsync thread competing with the guest threads is the difference between steady and stuttering frames.

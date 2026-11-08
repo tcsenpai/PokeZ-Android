@@ -58,7 +58,7 @@ uint64_t plat_thread_cpu_ns(void);  // the calling thread's CPU time so far (use
 // The calling thread is one of the frame's critical threads: on Windows, no power throttling (EcoQoS) for it and, on a
 // hybrid CPU, a preference for the performance cores (selected CPU sets; LARECOMP_PCORE=0: off). Elsewhere a no-op.
 enum { PLAT_PERF_GAME, PLAT_PERF_RENDER, PLAT_PERF_VSYNC };
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__ANDROID__)  // (Android: Thor experiment, LARECOMP_AFFINITY in platform/android.c)
 void plat_thread_perf_core(int role);
 #else
 static inline void plat_thread_perf_core(int role) { (void)role; }

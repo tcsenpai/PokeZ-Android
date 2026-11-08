@@ -129,6 +129,14 @@ SHADERC  ?= -lshaderc_shared
 # then died in a std::string call (tombstone: snapalloc::SnapConstraintParser::StringToEnumType). Nothing
 # here passes C++ objects across a library boundary, so a private copy is safe.
 LDFLAGS  := -shared -fuse-ld=lld -static-libstdc++ -Wl,-soname,libmain.so -Wl,--export-dynamic $(if $(DEPS),-L$(DEPS)/lib)             -lSDL3 -lavformat -lavcodec -lavutil -lswscale -lvulkan $(SHADERC) -llog -landroid -lnativewindow -lm
+# Thor experiments (eval only): VOLK=1 loads Vulkan through volk, so a custom driver (Turnip through libadrenotools,
+# ADRENOTOOLS=<its source dir with build/>) can stand in for the system's; GENARCH=<-mcpu=...> tunes the game code.
+ifeq ($(VOLK),1)
+DEPINC   += -I$(DEPS)/include/volk -I$(ADRENOTOOLS)/include -DVK_NO_PROTOTYPES -DVK_USE_PLATFORM_ANDROID_KHR \
+            -DIMGUI_IMPL_VULKAN_USE_VOLK -DLARECOMP_VOLK -D_GNU_SOURCE -include volk.h
+LDFLAGS  += $(ADRENOTOOLS)/build/libadrenotools.a $(ADRENOTOOLS)/build/lib/linkernsbypass/liblinkernsbypass.a -ldl
+endif
+GENFLAGS += $(GENARCH)
 BACKEND_SRC := $(wildcard runtime/nvn/vulkan/*.c) $(wildcard runtime/nvn/vulkan/*.cpp)
 BACKEND_OBJ := $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(patsubst runtime/%.c,$(B)/rt/%.o,$(BACKEND_SRC)))
 IMGUI_OBJ += $(B)/imgui/imgui_impl_vulkan.o
