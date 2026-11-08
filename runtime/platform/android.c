@@ -655,18 +655,39 @@ void plat_thread_guest(int prio) {
     pthread_setname_np(pthread_self(), "za-guest");
     if (g_aff_mode == 1 || g_aff_mode == 3) aff_apply(&g_set_notfast, "guest");
 }
+// The recorder thread (record.c, PLAT_PERF_RECORDER; PzRender): never on the fastest core, which is the render
+// thread's - LARECOMP_AFFINITY_RECORDER=fast puts it back there (as before), =big on the big ones, =0 Android decides.
+// With the render thread on the X3, each packet batch the render thread published woke the recorder on the same core,
+// which preempted it (Lumiose street, user save: the render thread runnable but not running 29 % of the time, ~21k
+// switches/s). On the big cores: 25.5 -> 28.3 fps, the game thread's wait for the translation 29.5 -> 13.1 ms a frame.
 void plat_thread_perf_core(int role) {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
-    static atomic_int renders;
     pthread_once(&once, aff_scan);
     pthread_setname_np(pthread_self(), role == PLAT_PERF_GAME ? "za-game" : role == PLAT_PERF_VSYNC ? "za-vsync" :
-                                       atomic_fetch_add(&renders, 1) ? "za-render2" : "za-render");
+                                       role == PLAT_PERF_RECORDER ? "za-recorder" : "za-render");
     if (!g_aff_mode || role == PLAT_PERF_VSYNC) return;
     cpu_set_t both = g_set_fast;
     CPU_OR(&both, &both, &g_set_big);
     bool game = role == PLAT_PERF_GAME;
     const cpu_set_t *s = g_aff_mode == 3 ? &both : (g_aff_mode == 1) == game ? &g_set_fast : &g_set_big;
+    if (role == PLAT_PERF_RECORDER) {
+        const char *e = getenv("LARECOMP_AFFINITY_RECORDER");
+        if (e && !strcmp(e, "0")) return;
+        if (e && !strcmp(e, "fast")) s = &g_set_fast;
+        else if ((e && !strcmp(e, "big")) || s == &g_set_fast) s = &g_set_big;
+        fprintf(stderr, "[cpu] recorder thread on the %s core(s)\n", s == &g_set_fast ? "fastest" : s == &g_set_big ? "big" : "fast + big");
+    }
     if (sched_setaffinity(0, sizeof *s, s) != 0) aff_apply(&both, game ? "game (fastest core parked: fast + big)" : "render");
+}
+// (PzRender) the render thread's helpers (shader translation, pipeline builds, texture unpacking) on every core but the
+// fastest: they inherited the render thread's affinity, so on the Thor all of them ran on the X3 with it.
+// LARECOMP_AFFINITY_WORKERS=0: left as inherited (as before)
+void plat_thread_worker(const char *name) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, aff_scan);
+    pthread_setname_np(pthread_self(), name);
+    const char *e = getenv("LARECOMP_AFFINITY_WORKERS");
+    if (g_aff_mode && (!e || atoi(e))) aff_apply(&g_set_notfast, name);
 }
 
 // SCHED_FIFO needs a privilege an app never has, so in practice this is the setpriority path. Worth keeping: on a

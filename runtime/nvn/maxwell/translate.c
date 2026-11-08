@@ -33,6 +33,7 @@ uint32_t maxwell_gmem_chunk_shift;  // 0: one buffer for the whole heap (GLSL; s
 bool maxwell_gmem_lazy;
 int maxwell_flat_default = 1;
 bool maxwell_quad_ops;  // (vk_exec_init: the device has quad subgroup operations in fragment shaders)
+bool maxwell_nmin;  // (vk_exec_init: shader.h)
 bool maxwell_gmem_fs_miss;
 bool maxwell_int64 = true;  // (vk_exec_init: false without shaderInt64 - 32-bit pairs in the GLSL, shader.h)
 bool maxwell_gmem_bda;  // (vk_exec_init: the guest window through its device address, shader.h)
@@ -2277,11 +2278,6 @@ static const char glsl_prelude[] =
     "int sx8(int v) { return bitfieldExtract(v, 0, 8); }\n"
     "int sx16(uint v) { return bitfieldExtract(int(v), 0, 16); }\n"
     "int sx16(int v) { return bitfieldExtract(v, 0, 16); }\n"
-    // MSL semantics: saturate(NaN) = 0, fmin/fmax return the non-NaN operand
-    "float saturate(float x) { return isnan(x) ? 0.0f : clamp(x, 0.0f, 1.0f); }\n"
-    "vec2 saturate(vec2 x) { return vec2(saturate(x.x), saturate(x.y)); }\n"
-    "float fmin(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : min(a, b)); }\n"
-    "float fmax(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : max(a, b)); }\n"
     // Maxwell's warps are 32 lanes. A subgroup of 64 (AMD's GCN / Vega GPUs always, any GPU whose driver picks it) holds
     // two of them: lane, ballot, vote and shuffle work on each 32-lane half as on a warp. gl_SubgroupSize is a
     // constant to the driver's compiler: with 32-lane subgroups only the plain subgroup operation is left.
@@ -2320,6 +2316,21 @@ static const char glsl_prelude[] =
     "uvec2 rscf(uvec2 c, vec4 s, vec4 r, vec2 p) { if (s.x == 1.0f && s.y == 1.0f) return c;"
     " if (any(notEqual(s.xy, r.xy))) return uvec2(floor((vec2(c) + 0.5f) * s.xy));"
     " return uvec2(floor(vec2(c) * s.xy) + floor(fract((p - r.zw) / r.xy) * s.xy)); }\n";
+// MSL semantics: saturate(NaN) = 0, fmin/fmax return the non-NaN operand (Maxwell's FMNMX and .SAT as well). By default
+// with explicit NaN tests; with maxwell_nmin as GLSL.std.450 NMin / NMax / NClamp, which have exactly these rules and
+// are one instruction each (Mesa: an exact fmin / fmax). The tests cost ~10 % of the main lighting shader's ALU
+// instructions on Turnip (that shader has 136 fmin / fmax calls: Maxwell's FMNMX).
+static const char glsl_minmax_tests[] =
+    "float saturate(float x) { return isnan(x) ? 0.0f : clamp(x, 0.0f, 1.0f); }\n"
+    "vec2 saturate(vec2 x) { return vec2(saturate(x.x), saturate(x.y)); }\n"
+    "float fmin(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : min(a, b)); }\n"
+    "float fmax(float a, float b) { return isnan(a) ? b : (isnan(b) ? a : max(a, b)); }\n";
+static const char glsl_minmax_nmin[] =
+    "spirv_instruction(set = \"GLSL.std.450\", id = 81) float nclamp(float x, float lo, float hi);\n"
+    "float saturate(float x) { return nclamp(x, 0.0f, 1.0f); }\n"
+    "vec2 saturate(vec2 x) { return vec2(saturate(x.x), saturate(x.y)); }\n"
+    "spirv_instruction(set = \"GLSL.std.450\", id = 79) float fmin(float a, float b);\n"
+    "spirv_instruction(set = \"GLSL.std.450\", id = 80) float fmax(float a, float b);\n";
 // The half <-> float helpers (glsl_finish: glsl_h2f_exact or glsl_h2f_native, then glsl_prelude_half).
 // Half -> float in vertex (and other pre-raster) shaders: by bits, not unpackHalf2x16. NVIDIA's driver recognises
 // unpacked halves and runs some of the fp32 math after them in native fp16, differently per shader, so a depth
@@ -2701,6 +2712,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     int set = stage == STAGE_FRAGMENT ? 1 : 0;
     Str s = {0};
     sp(&s, "#version 460\n");  // (the prelude's first line; an extension directive has to follow it)
+    if (maxwell_nmin) sp(&s, "#extension GL_EXT_spirv_intrinsics : require\n");
     if (info->uses_gmem && maxwell_gmem_chunk_shift && maxwell_gmem_lazy) sp(&s, "#extension GL_EXT_buffer_reference : require\n");
     if (info->uses_gmem && !maxwell_gmem_chunk_shift && maxwell_gmem_bda)
         sp(&s, "#extension GL_EXT_buffer_reference : require\n#extension GL_EXT_buffer_reference_uvec2 : require\n");
@@ -2711,6 +2723,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         const char *w = force ? strstr(pre, "gl_SubgroupSize == 32u") : NULL;
         if (w) sp(&s, "%.*sfalse%s", (int)(w - pre), pre, w + strlen("gl_SubgroupSize == 32u"));
         else sp(&s, "%s", pre);
+        sp(&s, "%s", maxwell_nmin ? glsl_minmax_nmin : glsl_minmax_tests);
     }
     static int exact = -1;
     if (exact < 0) exact = getenv("LARECOMP_VK_EXACT_H2F") && atoi(getenv("LARECOMP_VK_EXACT_H2F")) != 0;

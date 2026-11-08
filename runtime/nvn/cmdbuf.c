@@ -519,7 +519,16 @@ PLAIN(nvnCommandBufferBarrier, CMD_BARRIER)
 PLAIN(nvnCommandBufferSignalEvent, CMD_SIGNAL_EVENT)
 PLAIN(nvnCommandBufferWaitEvent, CMD_WAIT_EVENT)
 PLAIN(nvnCommandBufferReportCounter, CMD_REPORT_COUNTER)
-NVN(nvnCommandBufferReportValue) { (void)c; static int seen_; if (!seen_++ && ENV("LARECOMP_LOG_NOOP")) LOG("[nvn] no-op called: nvnCommandBufferReportValue\n"); }
+// ReportValue(cmdbuf, value, buffer address): the GPU writes the 32-bit value there when it reaches this point (a
+// semaphore release). It was a no-op (PzGlitch): a game resetting a GPU counter this way kept the old count - recorded
+// now, executed in GPU order (vulkan/exec.c report_value). LARECOMP_REPORT_VALUE=0: the no-op, as before.
+NVN(nvnCommandBufferReportValue) {
+    static int on = -1;
+    if (on < 0) on = !ENV("LARECOMP_REPORT_VALUE") || atoi(ENV("LARECOMP_REPORT_VALUE")) != 0;
+    if (!on) return;
+    Snap s = snap(c);
+    record(c, CMD_REPORT_VALUE, 0, &s);
+}
 NVN(nvnCommandBufferResetCounter) { (void)c; static int seen_; if (!seen_++ && ENV("LARECOMP_LOG_NOOP")) LOG("[nvn] no-op called: nvnCommandBufferResetCounter\n"); }
 NVN(nvnCommandBufferCallCommands) { record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
 // CopyCommands COPIES the lists into this command buffer: the game may record new commands into their memory right

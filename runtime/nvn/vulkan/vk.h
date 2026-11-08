@@ -249,6 +249,11 @@ typedef struct TexBackend {
     // (g_vk.lean_usage) the only formats views of this image may have: nview_fmt 0 = any compatible one
     VkFormat view_fmt[2];
     uint8_t nview_fmt;
+    // (LARECOMP_TEX_LOG_LATE, textures.c upload_texture) the frame of its first upload, how many since, and the share
+    // of zero words in the data last uploaded (per mille)
+    uint64_t up_frame;
+    uint32_t nuploads;
+    uint16_t zero_pm;
 } TexBackend;
 
 static inline bool vk_format_is_srgb(VkFormat f) {

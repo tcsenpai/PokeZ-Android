@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "../platform.h"
 #include "../rt.h"
@@ -50,6 +51,12 @@ static uint64_t d(uint64_t a, uint64_t b) { return a > b ? a - b : 0; }  // (a b
 #define LOAD_NS 2000000000ull     // a level change: its next 2 s are loading / fading in (measured: up to ~1 s)
 #define WINDOW_NS 60000000000ull  // the rate limit's period
 #define LINES_PER_WINDOW 20
+// (PzRender) LARECOMP_SLOW_LINES=<n>: lines per minute instead of 20 (hitch attribution runs: every slow frame)
+static int lines_max(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("LARECOMP_SLOW_LINES") ? atoi(getenv("LARECOMP_SLOW_LINES")) : LINES_PER_WINDOW;
+    return v;
+}
 
 // The level now, compared with the one seen last: a change starts a load window. False: not in play (title, file
 // select, the start screen, a reboot) - loading as well.
@@ -85,7 +92,7 @@ void slow_frame_present(uint64_t now, uint64_t gcpu) {
     if (win_start && now - win_start >= WINDOW_NS) {
         if (win_busy || win_load) {
             char s[160] = "";
-            if (win_busy) snprintf(s, sizeof s, "%llu past the limit of %d lines", (unsigned long long)win_busy, LINES_PER_WINDOW);
+            if (win_busy) snprintf(s, sizeof s, "%llu past the limit of %d lines", (unsigned long long)win_busy, lines_max());
             if (win_load)
                 snprintf(s + strlen(s), sizeof s - strlen(s), "%s%llu during loads", win_busy ? ", " : "", (unsigned long long)win_load);
             LOG("[slow] %llu more slow frame%s in the last minute, not logged (%s)\n", (unsigned long long)(win_busy + win_load),
@@ -98,13 +105,15 @@ void slow_frame_present(uint64_t now, uint64_t gcpu) {
         bool play = level_check(now, &changed_at, lv, sizeof lv);
         if (!win_start) win_start = now;
         if (!play || now - changed_at < LOAD_NS) win_load++;
-        else if (win_lines >= LINES_PER_WINDOW) win_busy++;
+        else if (win_lines >= lines_max()) win_busy++;
         else {
             win_lines++;
             extern uint64_t renderer_present_count(void);
             char b[640];
-            int n = snprintf(b, sizeof b, "[slow] frame %llu %llu ms in %s:", (unsigned long long)renderer_present_count(),
-                             (unsigned long long)(gap / 1000000), lv);
+            struct timespec rt;  // (PzRender: wall-clock time, to line the hitch up with a scenario's events)
+            clock_gettime(CLOCK_REALTIME, &rt);
+            int n = snprintf(b, sizeof b, "[slow] frame %llu %llu ms in %s (at %lld.%03ld):", (unsigned long long)renderer_present_count(),
+                             (unsigned long long)(gap / 1000000), lv, (long long)rt.tv_sec, rt.tv_nsec / 1000000);
             const char *sep = " ";
 #define PART(...) do { if (n < (int)sizeof b) n += snprintf(b + n, sizeof b - n, __VA_ARGS__); sep = ", "; } while (0)
             uint64_t v = d(cur.pipes, prev.pipes), hits = d(cur.hits, prev.hits);

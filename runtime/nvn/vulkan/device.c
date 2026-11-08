@@ -753,6 +753,12 @@ static void pipeline_cache_tag(char *out, size_t n) {
 // what a kill loses is every pipeline built since the last save. LARECOMP_PCACHE_SAVE_S=<s>: another interval.
 static void *pipeline_cache_saver(void *a) {
     (void)a;
+#ifdef __ANDROID__
+    // (PzRender: off the render thread's core when it was started from there - vkGetPipelineCacheData + the write,
+    // 6-9 ms every 30 s; weak: links without android.c's part)
+    extern void plat_thread_worker(const char *name) __attribute__((weak));
+    if (plat_thread_worker) plat_thread_worker("za-pcache");
+#endif
     const char *e = getenv("LARECOMP_PCACHE_SAVE_S");
     Uint32 ms = e && atoi(e) > 0 ? (Uint32)atoi(e) * 1000 : 30000;
     for (;;) {
@@ -1958,6 +1964,10 @@ void vk_frame_end(const char *shot_path) {
 }
 
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
+    // (PzGlitch) a relative path made absolute: SDL's file I/O on Android reads a relative path as an APK asset, so
+    // LARECOMP_SCREENSHOT_* / LARECOMP_SHOT_AT failed there with "Couldn't open asset"
+    char abs[1200];
+    if (path[0] != '/' && getcwd(abs, 1000)) { size_t l = strlen(abs); snprintf(abs + l, sizeof abs - l, "/%s", path); path = abs; }
     SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888, (void *)rgba, (int)w * 4);
     if (!s || !SDL_SavePNG(s, path)) LOG("[vk] saving %s failed: %s\n", path, SDL_GetError());
     else LOG("[vk] saved %s (%ux%u)\n", path, w, h);

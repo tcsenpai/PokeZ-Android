@@ -126,6 +126,9 @@ extern bool maxwell_gmem_lazy;
 // vk_exec_init).
 extern int maxwell_flat_default;
 extern bool maxwell_quad_ops;
+// GLSL: fmin / fmax / saturate as GLSL.std.450 NMin / NMax / NClamp (one instruction each) instead of explicit NaN
+// tests; the same NaN rules (translate.c glsl_minmax_nmin). Set before the first translation (exec.c vk_exec_init).
+extern bool maxwell_nmin;
 // GLSL with 64-bit integer types (carry chains, funnel shifts, global addresses) - true - or only 32-bit pairs with
 // explicit carries - false: a device without shaderInt64 (Qualcomm's own driver). Set before the first translation.
 extern bool maxwell_int64;

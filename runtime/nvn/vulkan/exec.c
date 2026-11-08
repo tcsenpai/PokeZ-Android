@@ -71,6 +71,20 @@ static bool list_fenced;       // the list being run has a FenceSync: its submis
 static uint32_t prof_end_line[4096];  // passes ended, by the exec.c line that ended them (0: submit / present)
 uint64_t prof_views_created;  // textures.c vk_image_view cache misses
 uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
+// (PzRender) render-thread CPU switches, LARECOMP_RENDER_OPT=<bits> (default 15 on Android, 0 elsewhere):
+// 1 the fragment-shader hash (draw_'s 512-byte hmix) once per program, 2 ib_overrun's index scan once per index range
+// and frame, 4 prefetch the command records ahead in exec_list, 8 stencil_slots' answer per stage while its handles repeat.
+// Thor, Lumiose street (user save, walking): render thread 10.2 -> 9.3 ms a frame, p95 frame 35.7 -> 33.4 ms
+enum { PZ_FSH_MEMO = 1, PZ_IB_MEMO = 2, PZ_PREFETCH = 4, PZ_SLOT_MEMO = 8 };
+static int pz_opt(int bit) {
+    static int v = -1;
+#ifdef __ANDROID__
+    if (v < 0) { const char *e = getenv("LARECOMP_RENDER_OPT"); v = e ? (int)strtol(e, NULL, 0) : 15; }
+#else
+    if (v < 0) { const char *e = getenv("LARECOMP_RENDER_OPT"); v = e ? (int)strtol(e, NULL, 0) : 0; }
+#endif
+    return v & bit;
+}
 #define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles;
@@ -161,9 +175,17 @@ static const uint64_t *cq_last_out;              // (cq_lock) the counter resolv
 static uint64_t cq_last_ticks;                   // two submissions
 static uint64_t snap_ring_end(void);             // (snap_storage: the copies' ring after the game's heap, for gmem_heap_size)
 
+// The highest submission seen completed (vk_completed_seq / vk_wait_seq): after a device loss the timeline can no longer
+// be read, and the loss reports said "finished up to 0" - this is what they show then (a lower bound)
+static _Atomic uint64_t done_seen;
+static void done_note(uint64_t v) {
+    uint64_t o = atomic_load(&done_seen);
+    while (v > o && !atomic_compare_exchange_weak(&done_seen, &o, v)) {}
+}
 uint64_t vk_completed_seq(void) {
     uint64_t v = 0;
     VK_CHECK(vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v));
+    done_note(v);
     return v;
 }
 
@@ -190,7 +212,8 @@ static void lost_report(uint64_t done) {
     static bool once;
     if (once) return;
     once = true;
-    LOG("[vk] last submissions (the GPU finished up to %llu):\n", (unsigned long long)done);
+    if (!done) done = atomic_load(&done_seen);
+    LOG("[vk] last submissions (the GPU finished up to %llu%s):\n", (unsigned long long)done, done ? ", last seen" : "");
     for (uint64_t k = subr_n > SUBR_N ? subr_n - SUBR_N : 0; k < subr_n; k++) {
         const SubRec *e = &subr[k % SUBR_N];
         LOG("[vk]   %llu%s t=%llu ms: %llu draws, %llu passes, %llu dispatches; last vs %llx fs %llx cs %llx; last pass %ux%u, %u colour (format %u), depth %u\n",
@@ -272,7 +295,7 @@ void vk_wait_seq(uint64_t seq) {
         ir_dump();
         FATAL("[vk] GPU did not finish submission %llu within 10 s; stopping before reusing in-flight resources\n",
               (unsigned long long)seq);
-    } else if (r == VK_SUCCESS) cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
+    } else if (r == VK_SUCCESS) done_note(seq), cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
     else {
         extern void vk_devlost_dump(void);
         ir_dump();
@@ -590,8 +613,9 @@ static void gw_explain(uint64_t pa) {
     LOG("\n");
 }
 
-static char gp_label[512][192];
-static uint32_t gp_draws[512], gp_clears[512], gp_clears_first[512];  // (clears: before the row's first draw, full area)
+#define GP_MAX 2048  // (marks per profiled frame: LARECOMP_GPUPROF_DRAWS adds one per draw)
+static char gp_label[GP_MAX][192];
+static uint32_t gp_draws[GP_MAX], gp_clears[GP_MAX], gp_clears_first[GP_MAX];  // (clears: before the row's first draw, full area)
 // LARECOMP_VK_DEVLOST_TRACE=1: the last 64 GPU operations, dumped on device loss (with LARECOMP_SYNC_SUBMIT=1 the
 // dump ends with the command list that faulted).
 #define DL_N 4096  // (a power of two)
@@ -644,12 +668,12 @@ void vk_devlost_dump(void) {
         }
 }
 static void gp_mark(VkCommandBuffer cb, const char *fmt, ...) {
-    if (!g_gpuprof_frame || gp_n >= 511) return;
+    if (!g_gpuprof_frame || gp_n >= GP_MAX - 1) return;
     if (!gp_qp) {
-        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = 512};
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = GP_MAX};
         if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &gp_qp) != VK_SUCCESS) { g_gpuprof_frame = false; return; }
     }
-    if (!gp_n) rec_CmdResetQueryPool(cb, gp_qp, 0, 512);
+    if (!gp_n) rec_CmdResetQueryPool(cb, gp_qp, 0, GP_MAX);
     rec_CmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, gp_qp, (uint32_t)gp_n);
     va_list ap;
     va_start(ap, fmt);
@@ -662,7 +686,7 @@ void renderer_flush(void);
 void vk_gpuprof_report(void) {
     if (!gp_n) return;
     renderer_flush();
-    uint64_t t[512];
+    static uint64_t t[GP_MAX];
     if (vkGetQueryPoolResults(g_vk.dev, gp_qp, 0, (uint32_t)gp_n, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
         double per = g_vk.props.limits.timestampPeriod / 1e6, total = (t[gp_n - 1] - t[0]) * per;
         LOG("[gpuprof] %d marks, %.2f ms first to last (rows: the work after each mark, until the next)\n", gp_n, total);
@@ -815,6 +839,13 @@ void renderer_wait_seq(uint64_t seq) {
     pthread_mutex_unlock(&seq_lock);
     wait_why = seq > s ? "SyncWait (fence not submitted yet)" : "SyncWait";
     if (seq > s) seq = s;  // not queued yet (other thread): everything queued so far (vk_wait_seq: the recorder, then the GPU)
+    {   // (PzGlitch test) LARECOMP_TEST_FENCE_EARLY=<n>: a fence wait returns once the submission n before it is done -
+        // the GPU n submissions behind what the game believes finished (reproduces races of CPU writes vs GPU work)
+        static long early = -1;
+        if (early < 0) early = ENV("LARECOMP_TEST_FENCE_EARLY") ? atol(ENV("LARECOMP_TEST_FENCE_EARLY")) : 0;
+        if (early > 0) seq = seq > (uint64_t)early ? seq - (uint64_t)early : 0;
+        if (!seq) return;
+    }
     if (overlap_on()) {  // (see deferred_seq) wait for the fence deferred last time, defer this one
         uint64_t done = vk_completed_seq();  // (the timeline's value: a submission the recorder hasn't made yet isn't done)
         pthread_mutex_lock(&seq_lock);
@@ -1084,6 +1115,10 @@ static __thread int t_build_slot;
 static void *worker(void *a) {
     int me = (int)(intptr_t)a;
     t_worker = me;
+#ifdef __ANDROID__
+    extern void plat_thread_worker(const char *name) __attribute__((weak));  // (PzRender: off the render thread's core,
+    if (plat_thread_worker) plat_thread_worker("za-build");                   // LARECOMP_AFFINITY_WORKERS=1; weak: links alone)
+#endif
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
         while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
@@ -1113,6 +1148,10 @@ static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
     (void)a;
+#ifdef __ANDROID__
+    extern void plat_thread_worker(const char *name) __attribute__((weak));  // (PzRender: as worker())
+    if (plat_thread_worker) plat_thread_worker("za-shader");
+#endif
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
         while (!tjobs_head) pthread_cond_wait(&tjobs_cond, &tjobs_lock);
@@ -1576,6 +1615,17 @@ void vk_exec_init(void) {
         maxwell_int64 = ie && *ie ? atoi(ie) != 0 : fe.shaderInt64 != 0;
         LOG("[vk] shader 64-bit integer math: %s (device shaderInt64 %d%s)\n", maxwell_int64 ? "native" : "32-bit pairs",
             fe.shaderInt64, ie && *ie ? ", LARECOMP_VK_INT64" : "");
+    }
+    {   // fmin / fmax / saturate as NMin / NMax / NClamp (translate.c glsl_minmax_nmin; the same NaN rules). On by
+        // default on Android: Thor / Adreno 740 + Turnip 27, Lumiose street walk, GPU 12.4 -> 12.0 ms a frame (p95 14.5 ->
+        // 13.9; lighting 2.50 -> 2.34, final post 1.33 -> 1.18). LARECOMP_SHADER_NMIN=0/1 forces it.
+        const char *e = getenv("LARECOMP_SHADER_NMIN");
+#ifdef __ANDROID__
+        maxwell_nmin = e && *e ? atoi(e) != 0 : true;
+#else
+        maxwell_nmin = e && *e ? atoi(e) != 0 : false;
+#endif
+        if (maxwell_nmin) LOG("[vk] shader min / max / saturate: GLSL.std.450 NMin / NMax / NClamp\n");
     }
     maxwell_gmem_bda = g_vk.gmem_bda;  // (device.c: the Android window through its device address)
     if (!getenv("LARECOMP_SHADER_FLAT") && !maxwell_flat_default)
@@ -2108,6 +2158,8 @@ static void za_red_blit(void) {
     static bool logged;
     if (!logged) { logged = true; LOG("[vk] sun-shadow reduced: the distant cascade drawn at %ux%u, copied into the game's layer 1\n", za_red_w, za_red_w); }
 }
+static void ac_run(void);  // (PzGlitch: the indirect parameter clamp, with draw_indirect)
+static bool ac_dirty;
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     vk_end_pass();
@@ -2115,6 +2167,7 @@ static void begin_pass(void) {
     planar_light_pending();   // (the lighting pass just ended: its draw again, on them)
     gtao_apply_pending();  // (the lighting pass just ended: its image times the ambient occlusion)
     water_apply_pending();  // (the water drawn: its reflections)
+    ac_run();  // (PzGlitch: GPU-filled indirect parameters clamped before the pass that draws them)
     if (dl_on == 2) renderer_flush();  // (LARECOMP_VK_DEVLOST_TRACE=2: each pass its own submission)
     else {
         // Submit the frame in chunks (as Metal, renderer.m begin_pass): the game puts a whole frame in one command
@@ -2145,7 +2198,10 @@ static void begin_pass(void) {
     }
     st.rt_dirty = false;
     VkCommandBuffer cb = vk_cmd();
-    vk_full_barrier(cb);  // passes, copies and dispatches see each other's results
+    // (diagnostic, wrong results possible) LARECOMP_VK_PASS_BARRIER=0: no barrier here - the most dropping it could gain
+    static int pass_barrier = -1;
+    if (pass_barrier < 0) pass_barrier = !ENV("LARECOMP_VK_PASS_BARRIER") || atoi(ENV("LARECOMP_VK_PASS_BARRIER")) != 0;
+    if (pass_barrier) vk_full_barrier(cb);  // passes, copies and dispatches see each other's results
     za_red_blit();  // (the pass just ended was a Reduzida far cascade: its results into the game's layer 1, ordered)
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
@@ -2657,6 +2713,7 @@ typedef struct {
     struct PipeMemo *pmemo;     // (render thread) draw_'s pipeline key memo for this program
     bool reuse;                 // set reuse (stage_set): some uniform buffers are dynamic, sets are kept while their contents repeat
     struct SetCache *scache[2]; // (render thread) stage_set's last set per set index
+    uint64_t fsh_addr, fsh;     // (render thread; PzRender) draw_'s fragment-shader hash (hmix) for this fragment code address
 } Prog;
 static void fullcap_draw(Prog *pr, CmdRec *r, bool indexed, uint32_t inst, int ndraw, bool gpu_params);  // (full capture)
 static void fullcap_before(void);  // (full capture: the targets just before a draw)
@@ -4496,7 +4553,10 @@ static void bind_note(int kind, uint64_t addr, uint64_t size) {
 // bound slot): the stage's effective storage table, with the copies' addresses where a range is snapshotted. Every
 // reader of the table in the draw / dispatch (drv_dedupe, cbuf_info, gmem_direct_pick, gmem_chunk_bind, gfast_prepare,
 // vc_mark_sbufs) takes sbufs(stage); st.sbuf itself keeps the game's bindings (rehashed next frame).
+static void ubo_order_note(uint64_t addr, uint64_t size);  // (PzGlitch: UpdateUniformBuffer in GPU order, below)
 static void snap_apply(int stage, uint32_t read_mask) {
+    if (stage == 5)
+        for (int i = 0; i < 16; i++) if (st.sbuf[5][i].addr) ubo_order_note(st.sbuf[5][i].addr, st.sbuf[5][i].size);
     bool on = snap_on();
     for (int i = 0; i < 16; i++)
         if (st.sbuf[stage][i].addr && ((read_mask >> i) & 1)) bind_note(stage == 5 ? 3 : 2, st.sbuf[stage][i].addr, st.sbuf[stage][i].size);
@@ -7046,6 +7106,7 @@ static void args_trace(const char *what, uint64_t code) {
 static void dispatch_compute_(uint32_t gx, uint32_t gy, uint32_t gz);
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     dispatch_compute_(gx, gy, gz);
+    ac_dirty = true;  // (PzGlitch: ac_run before the next pass)
     args_trace("dispatch", st.program ? st.program->stages[5].code_addr : 0);
 }
 static void dispatch_compute_(uint32_t gx, uint32_t gy, uint32_t gz) {
@@ -7178,6 +7239,15 @@ static uint32_t stencil_slots(int stage, uint32_t *sint) {
     static int nomemo = -1;
     if (nomemo < 0) nomemo = ENV("LARECOMP_VK_NO_SLOT_MEMO") != NULL;
     static struct { const NvnDescPool *pool; uint32_t tic, gen; int kind; } memo[4096];
+    // (PzRender, LARECOMP_RENDER_OPT & 8) the stage's whole answer while its 32 handles, the pool and the list repeat
+    // (most draws in a row): two 32-slot walks a draw were 4 % of the render thread on the Lumiose street
+    static struct { uint64_t tex[32]; const NvnDescPool *pool; uint32_t gen, m, sint; bool ok; } sm[2];
+    bool smo = !nomemo && pz_opt(PZ_SLOT_MEMO) && stage >= 0 && stage < 2;
+    if (smo && sm[stage].ok && sm[stage].pool == st.tpool && sm[stage].gen == exec_gen &&
+        !memcmp(sm[stage].tex, st.tex[stage], sizeof sm[stage].tex)) {
+        *sint = sm[stage].sint;
+        return sm[stage].m;
+    }
     for (int s = 0; s < 32; s++) {
         uint64_t h = st.tex[stage][s];
         uint32_t tic = h & 0xFFFFF;
@@ -7192,6 +7262,10 @@ static uint32_t stencil_slots(int stage, uint32_t *sint) {
         }
         if (k == 1) m |= 1u << s;
         if (k == 2) *sint |= 1u << s;
+    }
+    if (smo) {  // (PzRender)
+        memcpy(sm[stage].tex, st.tex[stage], sizeof sm[stage].tex);
+        sm[stage].pool = st.tpool, sm[stage].gen = exec_gen, sm[stage].m = m, sm[stage].sint = *sint, sm[stage].ok = true;
     }
     return m;
 }
@@ -7644,7 +7718,11 @@ static void draw_(CmdRec *r, bool indexed) {
         uint64_t fs = st.program->stages[1].code_addr;
         if (fs != last_fs) {
             last_fs = fs;
-            last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
+            if (fs && pz_opt(PZ_FSH_MEMO) && pr->fsh_addr == fs) last_hash = pr->fsh;  // (PzRender: once per program)
+            else {
+                last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
+                pr->fsh_addr = fs, pr->fsh = last_hash;
+            }
         }
         static uint64_t skip[16];
         static int nskip = -1;
@@ -8177,6 +8255,13 @@ static void draw_(CmdRec *r, bool indexed) {
     else pl_dc.a = count, pl_dc.b = run_n[0], pl_dc.c = first, pl_dc.e = base_inst + run_at[0];
     if (nruns == 1 && !raster_discard && planar_on())  // (the G-buffer's draws, kept to be drawn again mirrored)
         planar_capture(pr, pp, vl.used_streams, sets, ndyn, dyn, nv_dyn, gc_shift && (pr->vi->uses_gmem || pr->fi->uses_gmem), &pl_dc);
+    {   // LARECOMP_GPUPROF_DRAWS=<n> (with LARECOMP_GPUPROF_EVERY): a row per draw in passes with at least n colour
+        // targets (inside a GMEM pass a timestamp is the last bin's: profile with TU_DEBUG=sysmem)
+        static int gpd = -2;
+        if (gpd == -2) gpd = ENV("LARECOMP_GPUPROF_DRAWS") ? atoi(ENV("LARECOMP_GPUPROF_DRAWS")) : -1;
+        if (gpd >= 0 && g_gpuprof_frame && (int)pass_ncolor >= gpd)
+            gp_mark(cb, "draw %s %u x%u", indexed ? "indexed" : "arrays", use_index ? icount : count, inst);
+    }
     for (int ri = 0; ri < nruns; ri++) {
         if (nruns > 1 || run_gold[0]) {  // this run's tint: a fragment set of its own
             float rtint[RECOLOUR_TINT_FLOATS] = {0};
@@ -8627,9 +8712,25 @@ static bool ib_overrun(CmdRec *r, const uint32_t *p, uint64_t pa) {
     if (!count || count > (1u << 22) || !ib || ib < GUEST_LO) return false;
     uint32_t restart = st.prim_restart ? st.restart_index : 0xFFFFFFFFu, mx = 0;
     const uint8_t *ip = (const uint8_t *)(uintptr_t)(ib + first * isz);
-    for (uint64_t i = 0; i < count; i++) {
-        uint32_t v = isz == 1 ? ip[i] : isz == 2 ? ((const uint16_t *)ip)[i] : ((const uint32_t *)ip)[i];
-        if (v != (restart & (isz == 1 ? 0xFFu : isz == 2 ? 0xFFFFu : 0xFFFFFFFFu)) && v > mx) mx = v;
+    // (PzRender, LARECOMP_RENDER_OPT & 2) the same index range in the same frame (a mesh in the shadow cascades and the
+    // G-buffer: 2-4 draws a frame) scanned once - a guard, so indices the CPU rewrote mid-frame are checked next frame
+    static struct { uint64_t addr, frame; uint32_t count, key, mx; } im[1024];
+    uint64_t ia = (uint64_t)(uintptr_t)ip, fr = vk_frame_counter();
+    uint32_t ikey = isz | (restart << 3);
+    unsigned ms = (unsigned)(((ia >> 2) ^ (ia >> 13) ^ count * 0x9E3779B1u) & 1023);
+    bool memo = pz_opt(PZ_IB_MEMO);
+    if (memo && im[ms].addr == ia && im[ms].frame == fr && im[ms].count == count && im[ms].key == ikey) mx = im[ms].mx;
+    else {
+        if (isz == 2) {
+            const uint16_t *q = (const uint16_t *)ip;
+            uint32_t rs = restart & 0xFFFFu;
+            for (uint64_t i = 0; i < count; i++) if (q[i] != rs && q[i] > mx) mx = q[i];
+        } else
+            for (uint64_t i = 0; i < count; i++) {
+                uint32_t v = isz == 1 ? ip[i] : ((const uint32_t *)ip)[i];
+                if (v != (restart & (isz == 1 ? 0xFFu : 0xFFFFFFFFu)) && v > mx) mx = v;
+            }
+        if (memo) im[ms].addr = ia, im[ms].frame = fr, im[ms].count = (uint32_t)count, im[ms].key = ikey, im[ms].mx = mx;
     }
     int64_t last = (int64_t)mx + (int32_t)p[3];
     uint64_t stride = st.stream[s][0];
@@ -8647,6 +8748,111 @@ static bool ib_overrun(CmdRec *r, const uint32_t *p, uint64_t pa) {
     gw_explain(pa);
     stat_skipped_here();
     return true;
+}
+// ---- GPU-filled indirect parameters, clamped on the GPU (PzGlitch). ib_overrun / ind_args_bad check the parameters as
+// the CPU sees them; the instance count is the GPU's (Pokémon Z-A's culling compute writes it just before the draws).
+// When the culling's visible-instance list overran the parameters in the same buffer (a late-game Lumiose save on the
+// AYN Thor), a count of ~10^9 instances got through to the GPU: "gpu timeout", device lost. Every parameter block a
+// draw has read from GPU memory is kept (ac_note); when compute work ran since the last time, the next render pass is
+// preceded by a small compute pass over those blocks, in place: instances over the cap become the cap, and a block
+// whose vertex / index count no draw can have (over 4M) draws no instance. LARECOMP_ARGS_CLAMP=<cap> (default 65536;
+// 0: off). The game's culled counts are a few thousand at most (ind_args_bad's logs).
+#define AC_MAX 4096
+static uint32_t ac_word[AC_MAX];  // (GM_OFF of each block / 4)
+static int ac_n;
+static bool ac_dirty;
+static long args_clamp_cap(void) {
+    static long cap = -1;
+    if (cap < 0) cap = ENV("LARECOMP_ARGS_CLAMP") ? atol(ENV("LARECOMP_ARGS_CLAMP")) : 65536;
+    return cap;
+}
+static void ac_note(uint64_t off) {
+    if (args_clamp_cap() <= 0 || off & 3 || off / 4 > 0xFFFFFFFFull) return;
+    uint32_t w = (uint32_t)(off / 4), h = (w * 2654435761u) >> 20;  // (12 bits: a small open-addressing set)
+    static uint32_t set[AC_MAX];  // (w + 1; 0 empty)
+    for (int i = 0; i < AC_MAX; i++, h = (h + 1) & (AC_MAX - 1)) {
+        if (set[h] == w + 1) return;
+        if (!set[h]) {
+            if (ac_n >= AC_MAX / 2) return;  // (kept at most half full)
+            set[h] = w + 1, ac_word[ac_n++] = w;
+            return;
+        }
+    }
+}
+static void ac_run(void) {
+    long cap = args_clamp_cap();
+    if (cap <= 0 || !ac_dirty || !ac_n || !gmem_buf) return;
+    ac_dirty = false;
+    static VkDescriptorSetLayout sl;
+    static VkPipelineLayout pl;
+    static VkPipeline pipe;
+    static int failed;
+    if (failed) return;
+    if (!pipe) {
+        static const char *src =
+            "#version 450\n"
+            "layout(local_size_x = 64) in;\n"
+            "layout(std430, set = 0, binding = 0) buffer H { uint h[]; };\n"
+            "layout(std430, set = 0, binding = 1) readonly buffer O { uint o[]; };\n"
+            "layout(push_constant) uniform P { uint n; uint cap; } pc;\n"
+            "void main() {\n"
+            "  uint i = gl_GlobalInvocationID.x;\n"
+            "  if (i >= pc.n) return;\n"
+            "  uint w = o[i];\n"
+            "  if (h[w] > 4194304u) h[w + 1u] = 0u;\n"
+            "  else if (h[w + 1u] > pc.cap) h[w + 1u] = pc.cap;\n"
+            "}\n";
+        VkShaderModule m = vk_compile_glsl(src, STAGE_COMPUTE, "args_clamp.comp");
+        if (!m) { failed = 1; LOG("[vk] indirect parameter clamp: shader failed, off\n"); return; }
+        VkDescriptorSetLayoutBinding b[2];
+        for (int i = 0; i < 2; i++)
+            b[i] = (VkDescriptorSetLayoutBinding){.binding = (uint32_t)i, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                  .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+        VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 2, .pBindings = b};
+        VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &sl));
+        VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+        VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                         .pSetLayouts = &sl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &pi, NULL, &pl));
+        VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = pl,
+                                          .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                    .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"}};
+        VK_CHECK(vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipe));
+        LOG("[vk] indirect parameter clamp: on (instances <= %ld; LARECOMP_ARGS_CLAMP)\n", cap);
+    }
+    // the blocks' span, bound from an aligned base (they sit together in one buffer: a few hundred KB)
+    uint64_t lo = ~0ull, hi = 0, align = g_vk.props.limits.minStorageBufferOffsetAlignment;
+    if (!align) align = 256;
+    for (int i = 0; i < ac_n; i++) {
+        uint64_t a = (uint64_t)ac_word[i] * 4;
+        if (a < lo) lo = a;
+        if (a + 20 > hi) hi = a + 20;
+    }
+    lo -= lo % align;
+    if (hi > gmem_size) hi = gmem_size;
+    if (hi <= lo || hi - lo > g_vk.props.limits.maxStorageBufferRange) return;  // (scattered: not covered)
+    uint32_t idx[AC_MAX];
+    int n = 0;
+    for (int i = 0; i < ac_n; i++)
+        if ((uint64_t)ac_word[i] * 4 + 8 <= hi) idx[n++] = ac_word[i] - (uint32_t)(lo / 4);
+    if (!n) return;
+    VkSpan s = vk_transient_copy(idx, (uint64_t)n * 4, 256);
+    VkCommandBuffer cb = vk_cmd();
+    VkDescriptorSet set = vk_alloc_set(sl);
+    VkDescriptorBufferInfo bi[2] = {{gmem_buf, lo, (hi - lo + 3) & ~3ull}, {s.buf, s.off, (uint64_t)n * 4}};
+    VkWriteDescriptorSet w[2];
+    for (uint32_t k = 0; k < 2; k++)
+        w[k] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = k,
+                                      .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[k]};
+    rec_UpdateDescriptorSets(2, w);
+    vk_full_barrier(cb);
+    rec_CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    rec_CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, NULL);
+    uint32_t pc[2] = {(uint32_t)n, (uint32_t)cap};
+    rec_CmdPushConstants(cb, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    rec_CmdDispatch(cb, ((uint32_t)n + 63) / 64, 1, 1);
+    vk_full_barrier(cb);
+    gw_note("indirect parameter clamp", gwin_base + gmem_lo + lo, hi - lo, 0);
 }
 // Parameters no draw can have, in blocks the GPU reads in place (#70 #81 #82 #86: the GPU stopped for 10 s, or the
 // device was lost, where blocks held other data for frames on end - every field near one small number, a base
@@ -8731,6 +8937,7 @@ static void draw_indirect(CmdRec *r) {
             }
             if (ind_args_bad(p, pa, elements) || (elements && ib_overrun(r, p, pa))) continue;
             ir_note(pa, p, st.program ? st.program->stages[0].code_addr : 0);
+            ac_note(GM_OFF(pa));  // (PzGlitch: clamped on the GPU from now on, ac_run)
             g_ind_gpu = true; g_ind_off = GM_OFF(pa); g_ind_stride = stride;
             d.x[0] = r->x[0];
             if (elements) {
@@ -11309,12 +11516,142 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
     vmaDestroyImage(g_vk.vma, img, mem);
 }
 
+// ---- UpdateUniformBuffer in GPU order (PzGlitch). On the console the update is a GPU command: it lands when the GPU
+// gets there. Here it was a memcpy at translation time, which runs ahead of the GPU by up to a frame or two when the
+// GPU is the bottleneck. Pokémon Z-A resets the counter of its culling compute's visible-instance list this way, in
+// the same 256 KB storage buffer as the indirect draws' parameters: reset early, the previous frame's dispatches still
+// to run on the GPU counted on from 0 and the next frame's from there, so the list grew every frame until it ran over
+// the parameters (counts / instances holding instance ids and floats, "[ibguard] skipped draw", then a draw of
+// millions of instances: "gpu timeout" and device lost 10-60 s into a busy Lumiose street on the AYN Thor, GPU ~45
+// ms a frame; never in the light first street, where the GPU keeps up). An update into a range a compute dispatch
+// bound as storage in the last few seconds, inside the guest memory import, is now a buffer copy in the command
+// stream (outside a render pass, barriers on both sides) instead of the memcpy. Everything else stays a memcpy (cbuf
+// copies of later draws read it on the CPU). LARECOMP_UBO_GPU_ORDER=0: the memcpy as before; =2: both.
+#define UO_N 64
+static struct { uint64_t lo, hi, frame; } uo_tab[UO_N];
+static int ubo_gpu_order(void) {
+    static int m = -1;
+    if (m < 0) m = ENV("LARECOMP_UBO_GPU_ORDER") ? atoi(ENV("LARECOMP_UBO_GPU_ORDER")) : 1;
+    return m;
+}
+static void ubo_order_note(uint64_t addr, uint64_t size) {
+    if (!ubo_gpu_order() || !size) return;
+    uint64_t f = vk_frame_counter(), hi = addr + size;
+    int old = 0;
+    for (int i = 0; i < UO_N; i++) {
+        if (uo_tab[i].lo == addr && uo_tab[i].hi == hi) { uo_tab[i].frame = f; return; }
+        if (uo_tab[i].frame < uo_tab[old].frame) old = i;
+    }
+    uo_tab[old].lo = addr, uo_tab[old].hi = hi, uo_tab[old].frame = f;
+}
+static bool ubo_order_hit(uint64_t addr, uint64_t size) {
+    uint64_t f = vk_frame_counter();
+    for (int i = 0; i < UO_N; i++)
+        if (uo_tab[i].hi && uo_tab[i].frame + 300 >= f && addr < uo_tab[i].hi && uo_tab[i].lo < addr + size) return true;
+    return false;
+}
+// true: written in GPU order (the caller's memcpy is then left out, unless mode 2)
+static bool ubo_gpu_write(uint64_t dst, const void *src, uint64_t n) {
+    static int lg = -1;  // LARECOMP_LOG_UBO=1: every 300 frames, the distinct update targets and how they were taken (ubo_gpu_order)
+    if (lg < 0) lg = ENV("LARECOMP_LOG_UBO") ? 1 : 0;
+    if (lg) {
+        static struct { uint64_t a, n, cnt; int gm, hit, pass; } t[32];
+        static int nt;
+        static uint64_t last_f;
+        int gm = GM_IN(dst, n) ? 1 : 0, hit = ubo_order_hit(dst, n) ? 1 : 0, ps = in_pass ? 1 : 0, i = 0;
+        while (i < nt && !(t[i].a == dst && t[i].n == n && t[i].gm == gm && t[i].hit == hit && t[i].pass == ps)) i++;
+        if (i == nt && nt < 32) t[nt].a = dst, t[nt].n = n, t[nt].gm = gm, t[nt].hit = hit, t[nt].pass = ps, t[nt].cnt = 0, nt++;
+        if (i < 32) t[i].cnt++;
+        uint64_t f = vk_frame_counter();
+        if (f / 300 != last_f / 300) {
+            last_f = f;
+            for (int k = 0; k < nt; k++)
+                LOG("[ubo] to frame %llu: update %llx+%llu x%llu: in the import %d, compute storage %d, in a pass %d\n",
+                    (unsigned long long)f, (unsigned long long)t[k].a, (unsigned long long)t[k].n, (unsigned long long)t[k].cnt,
+                    t[k].gm, t[k].hit, t[k].pass);
+            nt = 0;
+        }
+    }
+    if (!ubo_gpu_order() || !n || (dst | n) & 3 || !GM_IN(dst, n) || !ubo_order_hit(dst, n)) return false;
+    static uint64_t count, in_pass_count;
+    in_pass_count += in_pass;
+    if (count++ % 3000 == 0)
+        LOG("[ubo] UpdateUniformBuffer into compute storage, in GPU order: %llu (%llu ended a render pass; last %llx+%llu)\n",
+            (unsigned long long)count, (unsigned long long)in_pass_count, (unsigned long long)dst, (unsigned long long)n);
+    vk_end_pass();
+    VkSpan s = vk_transient_copy(src, n, 16);
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkBufferCopy c = {s.off, GM_OFF(dst), n};
+    rec_CmdCopyBuffer(cb, s.buf, gmem_buf, 1, &c);
+    vk_full_barrier(cb);
+    gw_note("UpdateUniformBuffer (GPU order)", dst, n, 0);
+    return ubo_gpu_order() != 2;
+}
+
+// nvnCommandBufferClearBuffer(dst, size, value) (PzGlitch): recorded (cmdbuf.c) but never executed - the executor had
+// no case for it, so the buffer kept its old contents. Pokémon Z-A clears the counters of its culling compute's
+// visible-instance lists this way; never cleared, the lists grew every frame until they ran over the indirect draws'
+// parameters in the same buffer (instance counts of millions: "gpu timeout", device lost 10-60 s into the Lumiose
+// street of a late-game save on the AYN Thor). Inside the guest memory import: a copy of the value in the command
+// stream (GPU order, outside a render pass, barriers on both sides), elsewhere the CPU fills it after the GPU work
+// before (as CopyBufferToBuffer). LARECOMP_CLEAR_BUFFER=0: skipped, as before.
+static void gpu_fill(uint64_t dst, uint64_t size, uint32_t value, const char *what);
+static void clear_buffer(uint64_t dst, uint64_t size, uint32_t value) {
+    static int on = -1;
+    if (on < 0) on = !ENV("LARECOMP_CLEAR_BUFFER") || atoi(ENV("LARECOMP_CLEAR_BUFFER")) != 0;
+    static uint64_t count;
+    if (count++ % 3000 == 0)
+        LOG("[vk] ClearBuffer #%llu: %llx+%llu = %#x%s\n", (unsigned long long)count, (unsigned long long)dst,
+            (unsigned long long)size, value, on ? "" : " (skipped: LARECOMP_CLEAR_BUFFER=0)");
+    if (on) gpu_fill(dst, size, value, "ClearBuffer");
+}
+// nvnCommandBufferReportValue(value, dst) (PzGlitch; cmdbuf.c): the 32-bit value written in GPU order
+static void report_value(uint32_t value, uint64_t dst) {
+    static uint64_t count;
+    static int nlog;
+    if (nlog < 24 || count % 9000 == 0)
+        nlog++, LOG("[vk] ReportValue #%llu: %llx = %#x (in the import %d)\n", (unsigned long long)count + 1,
+                    (unsigned long long)dst, value, GM_IN(dst, 4) ? 1 : 0);
+    count++;
+    gpu_fill(dst, 4, value, "ReportValue");
+}
+// value into [dst, dst + size): in the command stream inside the guest memory import, else on the CPU after a flush
+static void gpu_fill(uint64_t dst, uint64_t size, uint32_t value, const char *what) {
+    if (!dst || !size || dst < GUEST_LO || size > (256ull << 20)) return;
+    size &= ~3ull;
+    gmem_info();  // (the import, made on first use)
+    gw_note(what, dst, size, value);
+    if (GM_IN(dst, size) && !(dst & 3)) {
+        vk_end_pass();
+        VkCommandBuffer cb = vk_cmd();
+        vk_full_barrier(cb);
+        for (uint64_t done = 0; done < size;) {
+            uint64_t n = size - done > (4ull << 20) ? 4ull << 20 : size - done;
+            VkSpan s = vk_transient(n, 16);
+            uint32_t *w = s.ptr;
+            for (uint64_t i = 0; i < n / 4; i++) w[i] = value;
+            VkBufferCopy c = {s.off, GM_OFF(dst + done), n};
+            rec_CmdCopyBuffer(cb, s.buf, gmem_buf, 1, &c);
+            done += n;
+        }
+        vk_full_barrier(cb);
+        return;
+    }
+    // (outside the import the GPU can't see it anyway: ClearBuffer waits for the work before it, a ReportValue -
+    // possibly every frame - is written at once, as close as the CPU gets)
+    if (strcmp(what, "ReportValue")) { wait_why = "ClearBuffer (outside the import)"; renderer_flush(); }
+    uint32_t *w = (uint32_t *)(uintptr_t)dst;
+    for (uint64_t i = 0; i < size / 4; i++) w[i] = value;
+}
+
 // ================================================================== executor (renderer.m exec_list)
 static void exec_list(uint64_t handle, int depth) {
     uint64_t p = handle;
     for (int guard = 0; guard < 10000000; guard++) {
         CmdRec *r = (CmdRec *)(uintptr_t)p;
         void *x = r->extra;
+        if (pz_opt(PZ_PREFETCH)) __builtin_prefetch((const char *)r + 256), __builtin_prefetch((const char *)r + 512);  // (PzRender)
         if (r->op < CMD_COUNT) op_counts[r->op]++;
         switch (r->op) {
         case CMD_END: return;
@@ -11577,7 +11914,7 @@ static void exec_list(uint64_t handle, int depth) {
                 if (fl < 0) fl = ENV("LARECOMP_UBO_FLUSH") ? 1 : 0;
                 if (fl) { wait_why = "UpdateUniformBuffer (test)"; renderer_flush(); }
             }
-            memcpy((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3]);
+            if (!ubo_gpu_write(r->x[0] + r->x[2], x, r->x[3])) memcpy((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3]);
             guest_copy_flush();  // (cbuf copies shared within the submission are stale now)
             break;
         case CMD_FENCE_SYNC: {
@@ -11638,7 +11975,9 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_COPY_TEXTURE_TO_TEXTURE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], r->x[6]); break; }
         case CMD_DOWNSAMPLE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); break; }
         case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); break;
+        case CMD_REPORT_VALUE: report_value((uint32_t)r->x[0], r->x[1]); break;  // (PzGlitch: was a no-op)
         case CMD_COPY_TEXTURE_TO_BUFFER: pw_op("CopyTextureToBuffer", r->x[3], 0); copy_texture_to_buffer(x, r->x[3]); break;
+        case CMD_CLEAR_BUFFER: clear_buffer(r->x[0], r->x[1], (uint32_t)r->x[2]); break;  // (PzGlitch: was skipped)
         case CMD_COPY_BUFFER_TO_BUFFER:
             pw_op("CopyBufferToBuffer", r->x[1], r->x[2]);
             wait_why = "buffer -> buffer copy";

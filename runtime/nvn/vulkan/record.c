@@ -102,17 +102,24 @@ static void timed_wait(pthread_cond_t *cv, uint64_t ns) {  // (mu held)
     pthread_cond_timedwait(cv, &mu, &ts);
 }
 
-// T: what it wrote so far is the recorder's to run
-static void publish(void) {
-    if (published == wpos) return;
-    published = wpos;
-    atomic_store_explicit(&head, wpos, memory_order_seq_cst);
-    if (atomic_load_explicit(&asleep, memory_order_seq_cst)) {
-        pthread_mutex_lock(&mu);
-        pthread_cond_signal(&cv_work);
-        pthread_mutex_unlock(&mu);
+// T: what it wrote so far is the recorder's to run. force (submissions, presents, waits, a full ring): a sleeping
+// recorder is woken; otherwise (commit) only once wake_bytes are waiting for it (PzRender: LARECOMP_VK_RECORDER_WAKE_KB,
+// default 64 on Android (elsewhere 0); 0 = at every 4 KB publish, as before - each wake cost the render thread a futex call, and preempted it
+// while the recorder shared its core: ~21k switches/s on the Lumiose street; 64 KB: 25.5 -> 27.6 fps alone there)
+static uint64_t wake_bytes;
+static void publish_at(bool force) {
+    if (published != wpos) {
+        published = wpos;
+        atomic_store_explicit(&head, wpos, memory_order_seq_cst);
     }
+    if (!atomic_load_explicit(&asleep, memory_order_seq_cst)) return;
+    uint64_t behind = wpos - atomic_load_explicit(&tail, memory_order_acquire);
+    if (!behind || (!force && behind < wake_bytes)) return;
+    pthread_mutex_lock(&mu);
+    pthread_cond_signal(&cv_work);
+    pthread_mutex_unlock(&mu);
 }
+static void publish(void) { publish_at(true); }
 
 // T: room for `need` bytes at wpos (the recorder frees room as it records; a full ring means it is behind by its
 // whole size, 16 MB of packets - a long way, so the wait is rare)
@@ -154,7 +161,7 @@ static void *push(PktFn fn, size_t args, size_t extra) {
     return h + 1;
 }
 static void commit(void) {
-    if (wpos - published >= PUBLISH_EVERY) publish();
+    if (wpos - published >= PUBLISH_EVERY) publish_at(false);  // (PzRender: the wake throttled, publish_at)
 }
 // (the arrays of a packet: after its arguments, 16-aligned)
 #define AL16(n) (((n) + 15) & ~(size_t)15)
@@ -163,7 +170,7 @@ static inline void *after(const void *args, size_t args_size) { return (uint8_t 
 // ---- the thread
 static void *run(void *arg) {
     (void)arg;
-    plat_thread_perf_core(PLAT_PERF_RENDER);  // (Windows hybrid CPUs: the performance cores, as the render thread)
+    plat_thread_perf_core(PLAT_PERF_RECORDER);  // (Windows hybrid CPUs: the performance cores; Android: PzRender, android.c)
     rq_watch(NULL, 0);                        // (the hang dump knows this thread)
     uint64_t t = 0;
     for (;;) {
@@ -196,6 +203,12 @@ void rec_init(bool prof_on) {
     if (on >= 0) return;
     prof = prof_on;
     const char *e = getenv("LARECOMP_VK_RECORDER");
+    const char *wk = getenv("LARECOMP_VK_RECORDER_WAKE_KB");  // (PzRender: publish_at)
+#ifdef __ANDROID__
+    wake_bytes = (uint64_t)(wk ? atoi(wk) : 64) << 10;  // (measured on the Thor; elsewhere as before unless asked)
+#else
+    wake_bytes = (uint64_t)(wk ? atoi(wk) : 0) << 10;
+#endif
     int want = !e || atoi(e) != 0;
     // ARM's Mali drivers: the GPU was lost a few seconds into the title screen with the recorder thread on (Mali-G610,
     // #358) and ran fine with it off; LARECOMP_VK_RECORDER=1 still turns it on there
@@ -295,7 +308,11 @@ void rec_drain_published(void) {
     if (on <= 0 || pthread_equal(pthread_self(), rec_thread)) return;  // (an exit from the recorder itself: nothing to wait for)
     uint64_t upto = atomic_load_explicit(&head, memory_order_acquire), t0 = NOW();
     pthread_mutex_lock(&mu);  // (bounded: at exit a recorder stuck in the driver must not keep the process alive)
-    while (atomic_load_explicit(&tail, memory_order_acquire) < upto && NOW() - t0 < 5000000000ull) timed_wait(&cv_done, 2000000);
+    // (PzRender: published packets a throttled publish_at left the recorder asleep on are woken for here)
+    while (atomic_load_explicit(&tail, memory_order_acquire) < upto && NOW() - t0 < 5000000000ull) {
+        pthread_cond_signal(&cv_work);
+        timed_wait(&cv_done, 2000000);
+    }
     pthread_mutex_unlock(&mu);
 }
 

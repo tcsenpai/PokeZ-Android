@@ -44,6 +44,20 @@ static VkFormat depth24_stencil8(void) {
     return f;
 }
 
+// NVN RGB565 (0x3C) keeps red in the low bits: VK_FORMAT_B5G6R5_UNORM_PACK16 (Metal's B5G6R5Unorm, as MoltenVK maps
+// them). R5G6B5 swapped red and blue: Echoes of Wisdom's hearts (HUD, file select) take their alpha from such a mask's
+// red, and drew as solid red squares. B5G6R5 isn't a mandatory format: R5G6B5 where a driver lacks it.
+static VkFormat rgb565(void) {
+    static VkFormat f;
+    if (!f) {
+        VkFormatProperties p;
+        vkGetPhysicalDeviceFormatProperties(g_vk.phys, VK_FORMAT_B5G6R5_UNORM_PACK16, &p);
+        f = p.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT ? VK_FORMAT_B5G6R5_UNORM_PACK16 : VK_FORMAT_R5G6B5_UNORM_PACK16;
+        if (f == VK_FORMAT_R5G6B5_UNORM_PACK16) LOG("[vk] no B5G6R5: RGB565 textures with red and blue swapped\n");
+    }
+    return f;
+}
+
 static VkFmt fmt_of(uint32_t f) {
     switch (f) {
     case 0x01: return (VkFmt){VK_FORMAT_R8_UNORM};
@@ -94,7 +108,7 @@ static VkFmt fmt_of(uint32_t f) {
     case 0x39: return (VkFmt){VK_FORMAT_R4G4B4A4_UNORM_PACK16};   // Metal ABGR4Unorm
     case 0x3A: return (VkFmt){VK_FORMAT_R5G6B5_UNORM_PACK16};     // Metal B5G6R5Unorm
     case 0x3B: return (VkFmt){VK_FORMAT_R5G5B5A1_UNORM_PACK16};   // Metal A1BGR5Unorm
-    case 0x3C: return (VkFmt){VK_FORMAT_R5G6B5_UNORM_PACK16};
+    case 0x3C: return (VkFmt){rgb565()};
     case 0x3D: return (VkFmt){VK_FORMAT_A2B10G10R10_UNORM_PACK32};
     case 0x3E: return (VkFmt){VK_FORMAT_A2B10G10R10_UINT_PACK32};
     case 0x3F: return (VkFmt){VK_FORMAT_B10G11R11_UFLOAT_PACK32};
@@ -983,6 +997,11 @@ static void unpack_some(void) {  // (the queue's next items, until none are left
 
 static void *unpack_helper(void *arg) {
     (void)arg;
+#ifdef __ANDROID__
+    // (PzRender: off the render thread's core, LARECOMP_AFFINITY_WORKERS=1; weak: links without android.c's part)
+    extern void plat_thread_worker(const char *name) __attribute__((weak));
+    if (plat_thread_worker) plat_thread_worker("za-unpack");
+#endif
     uint32_t seen = 0;
     for (;;) {
         pthread_mutex_lock(&up_lock);
@@ -1026,6 +1045,62 @@ void vk_tex_unpack_finish(void) {
 
 uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn, prof_tex_watch_skips;
 uint64_t prof_tex_watch_written, prof_tex_watch_unknown, prof_tex_watch_gpu;  // (checks the page tracking couldn't skip: why)
+// LARECOMP_TEX_LOG_LATE=1 (diagnostics): textures whose data changed after their first upload ("[texlate]": how many
+// frames later, how the check found it, the share of zero words before and after), uploads of mostly-zero data, and
+// every 300 frames a summary. A texture uploaded before the game finished writing it shows its old / missing data
+// until a check sees the change: what "textures load in pieces" would look like if it came from here.
+static int tex_log_late(void) {
+    static int on = -1;
+    if (on < 0) on = ENV("LARECOMP_TEX_LOG_LATE") ? atoi(ENV("LARECOMP_TEX_LOG_LATE")) : 0;
+    return on;
+}
+static uint16_t zero_permille(const uint8_t *p, uint64_t n) {
+    uint64_t z = 0, w = n / 8;
+    for (uint64_t i = 0; i < w; i++) { uint64_t v; memcpy(&v, p + i * 8, 8); z += v == 0; }
+    return w ? (uint16_t)(z * 1000 / w) : 0;
+}
+static void tex_note_late(NvnTexture *t, TexBackend *b, const uint8_t *mem, uint64_t total, uint64_t h, const char *why,
+                          bool was_prefetched, uint64_t frame) {
+    static uint64_t n_first, n_first_zero, n_late, n_late_sample, n_late_periodic, n_late_dyn, late_frames, sum_frame, late_bytes;
+    static uint64_t n_late_big;  // (over 16 frames late)
+    static int nlog;
+    if (!b->uploaded) {
+        b->up_frame = frame;
+        b->nuploads = 1;
+        b->zero_pm = zero_permille(mem, total);
+        n_first++;
+        if (b->zero_pm > 500) {
+            n_first_zero++;
+            if (nlog < 400) nlog++, LOG("[texlate] frame %llu: %llx %ux%u fmt %#x %u lv %lluKB first uploaded %u/1000 zero (%s)\n",
+                                       (unsigned long long)frame, (unsigned long long)t->addr, t->width, t->height, t->format,
+                                       t->layout.levels, (unsigned long long)(total >> 10), b->zero_pm, was_prefetched ? "prefetch" : "use");
+        }
+    } else if (h != b->data_hash) {
+        uint16_t zp = zero_permille(mem, total);
+        uint64_t late = frame - b->up_frame;
+        if (b->dynamic && strcmp(why, "periodic")) n_late_dyn++;
+        else {
+            n_late++, late_frames += late, late_bytes += total;
+            n_late_sample += !strcmp(why, "sample"), n_late_periodic += !strcmp(why, "periodic");
+            n_late_big += late > 16;
+            if (nlog < 400) nlog++, LOG("[texlate] frame %llu: %llx %ux%u fmt %#x %u lv %lluKB changed %llu frames after its first "
+                                       "upload (upload %u, found by %s%s), zeros %u -> %u /1000\n", (unsigned long long)frame,
+                                       (unsigned long long)t->addr, t->width, t->height, t->format, t->layout.levels,
+                                       (unsigned long long)(total >> 10), (unsigned long long)late, b->nuploads + 1, why,
+                                       was_prefetched ? ", prefetched" : "", b->zero_pm, zp);
+        }
+        b->nuploads++;
+        b->zero_pm = zp;
+    }
+    if (frame / 300 != sum_frame) {
+        sum_frame = frame / 300;
+        LOG("[texlate] summary to frame %llu: %llu first uploads (%llu mostly zero), %llu later changes (%llu MB; by sample %llu, "
+            "periodic %llu; %llu over 16 frames late, mean %.1f frames), %llu changes of dynamic ones\n", (unsigned long long)frame,
+            (unsigned long long)n_first, (unsigned long long)n_first_zero, (unsigned long long)n_late,
+            (unsigned long long)(late_bytes >> 20), (unsigned long long)n_late_sample, (unsigned long long)n_late_periodic,
+            (unsigned long long)n_late_big, n_late ? (double)late_frames / n_late : 0.0, (unsigned long long)n_late_dyn);
+    }
+}
 static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (!t->addr || t->target == 10) return;
     uint64_t frame = vk_frame_counter();
@@ -1047,13 +1122,14 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     static int always_full = -1;
     if (always_full < 0) always_full = ENV("LARECOMP_TEX_FULLHASH") ? 1 : 0;
     bool full = b->dynamic || !b->uploaded || always_full;
+    const char *why = b->dynamic ? "dynamic" : !b->uploaded ? "first" : always_full ? "always" : "sample";  // (LOG_LATE)
     // (safety net: a full hash now and then. Every 600 frames - 10 s at 60 fps: since the page tracking covers the textures
     // outside the guest memory window too (exec.c pages_changed_outside), it rehashed up to 150 MB a second, finding
     // nothing. LARECOMP_TEX_RECHECK=<frames>: another interval)
     static long recheck = -1;
     if (recheck < 0) recheck = ENV("LARECOMP_TEX_RECHECK") ? atol(ENV("LARECOMP_TEX_RECHECK")) : 600;
     bool periodic = frame - b->full_frame >= (uint64_t)recheck && full_hash_budget >= total;
-    if (!full && periodic) { full = true; full_hash_budget -= total; }
+    if (!full && periodic) { full = true; full_hash_budget -= total; why = "periodic"; }
     bool identified_now = !b->tp;  // (button prompts / Hero Mode icon: re-uploaded when their look changes)
     if (identified_now) b->tp = texpatch_marker(t);
     bool restyle = b->tp > 0 && b->tp <= TEXPATCH_RECOLOUR_BASE && b->uploaded && b->tp_gen != texpatch_generation();
@@ -1092,6 +1168,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     // (the sample is only compared while the texture isn't dynamic, and a dynamic one stays so: none for those)
     if (!fast) b->sample_hash = fnv_sample(mem, total);
     else if (!b->dynamic && !(b->uploaded && h != b->data_hash)) b->sample_hash = tex_hash_sample(mem, total);
+    if (tex_log_late()) tex_note_late(t, b, mem, total, h, why, was_prefetched, frame);
     if (b->uploaded && h == b->data_hash && !restyle) return;
     if (tracked_clean && h != b->data_hash) {
         static int nmiss;
