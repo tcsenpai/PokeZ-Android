@@ -4,8 +4,9 @@
 // pipelines). Mirrors the Metal backend's behaviour; differences are noted where they happen.
 //
 // Synchronisation model: every image lives in VK_IMAGE_LAYOUT_GENERAL, and a full memory barrier separates
-// render passes, copies and dispatches (Metal tracks these hazards itself). Submissions are numbered; a timeline
-// semaphore signals each number, which is what NVN fences (renderer_fence_seq / renderer_wait_seq) wait for.
+// render passes, copies and dispatches (Metal tracks these hazards itself). Submissions are numbered; each signals its
+// number on a timeline semaphore (exec.c, LARECOMP_VK_SEQ_POLL=1: writes it into a host-visible completion marker
+// instead), which is what NVN fences (renderer_fence_seq / renderer_wait_seq) wait for.
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
@@ -133,7 +134,7 @@ typedef struct {
     VmaAllocator vma;
     VkPhysicalDeviceProperties props;
     VkPipelineCache pcache;
-    VkSemaphore timeline;      // value = last completed submission number
+    VkSemaphore timeline;      // value = last completed submission number (unless exec.c's LARECOMP_VK_SEQ_POLL=1)
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import, dmabuf;
     bool ahb_import;  // (Android) AHardwareBuffer import: the guest memory the GPU shares (exec.c gmem_import)
@@ -197,6 +198,7 @@ uint64_t vk_pending_seq(void);        // number the pending submission will get
 #define VK_DEAD_MARGIN 2
 uint64_t vk_completed_seq(void);
 void vk_wait_seq(uint64_t seq);
+bool vk_seq_wait_for(uint64_t seq, uint64_t timeout_ns);  // (no fatal: true once done; the pacer, record.c)
 void vk_full_barrier(VkCommandBuffer cb);
 void vk_end_pass(void);
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra);  // submit + one more cb (present)

@@ -54,7 +54,8 @@ bool rec_set_recycle(void);        // a slot's sets are handed out again instead
 void rec_UpdateDescriptorSets(uint32_t n, const VkWriteDescriptorSet *w);
 
 // ---- waits (any thread)
-uint64_t rec_submitted(void);          // the latest submission handed to the driver (the timeline value it signals)
+uint64_t rec_submitted(void);          // the latest submission handed to the driver (its number: completion marker / timeline value)
+VkResult rec_queue_wait_idle(void);    // vkQueueWaitIdle under the queue's lock (exec.c: a stuck marker wait, device-lost check)
 void rec_wait_submitted(uint64_t seq); // until the driver has submission seq (seq must have been passed to rec_QueueSubmit2)
 void rec_wait_presents(uint64_t n);    // until the recorder made n presents (rec_presents_queued() counts them)
 uint64_t rec_presents_queued(void);
@@ -148,3 +149,4 @@ void rec_CmdCopyImageToBuffer(VkCommandBuffer cb, VkImage src, VkImageLayout sl,
 void rec_CmdExecuteCommands(VkCommandBuffer cb, uint32_t n, const VkCommandBuffer *cbs);  // (secondaries, ended, of a pool of the caller's)
 void rec_CmdResetQueryPool(VkCommandBuffer cb, VkQueryPool pool, uint32_t first, uint32_t n);
 void rec_CmdWriteTimestamp2(VkCommandBuffer cb, VkPipelineStageFlags2 stage, VkQueryPool pool, uint32_t query);
+void rec_CmdUpdateBuffer8(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, uint64_t v);  // (8 bytes: the completion marker)

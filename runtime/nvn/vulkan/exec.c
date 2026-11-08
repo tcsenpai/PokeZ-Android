@@ -182,11 +182,50 @@ static void done_note(uint64_t v) {
     uint64_t o = atomic_load(&done_seen);
     while (v > o && !atomic_compare_exchange_weak(&done_seen, &o, v)) {}
 }
+
+// The completion marker (LARECOMP_VK_SEQ_POLL=1; PzSync). Turnip on kgsl emulates timeline semaphores (mesa
+// vk_sync_timeline): vkGetSemaphoreCounterValue and a zero-timeout vkWaitSemaphores can block until the submission just
+// made is done, and every vkQueueSubmit2 that signals the timeline first waits on the CPU for its earlier points
+// (vk_sync_timeline_gc_locked -> kgsl_syncobj_wait) - EoWRecomp 99834cd: the game and the GPU ran in turns. With it on,
+// each submission ends with a full barrier and writes its number into this small host-coherent buffer, the timeline is
+// no longer signalled: vk_completed_seq reads the marker, vk_wait_seq polls it (sleeps from 20 us up to
+// LARECOMP_VK_SEQ_POLL_US, default 500; after 10 s the queue's own wait tells a lost device from a stuck GPU).
+// Off by default: here the recorder thread makes the submissions, and on the Thor (Adreno 740, Turnip 27 R2, user
+// save) a 20 s off-CPU profile showed no such wait - vkQueueSubmit2 1.8 % of the recorder's time, vk_completed_seq
+// none - and the A/B was even: 30 fps mode 30.0 / 30.0 fps (p95 33.4, 3 frames > 50 ms each), 60 fps mode 40.1-48.5
+// vs 41.1-45.8 fps (the game's own 30 / 60 switching decides), its 60-mode frames p50 18.4-18.5 vs 18.0-18.2 ms.
+static VkBuffer seq_buf;
+static VmaAllocation seq_mem;
+static volatile uint64_t *seq_ptr;  // (null: the timeline)
+static uint64_t seq_sleep_max_ns = 500000;
+// The last completed submission without a fatal error (the loss reports: after a device loss the timeline can't be read)
+static bool seq_read(uint64_t *v) {
+    if (seq_ptr) { *v = *seq_ptr; return true; }
+    return vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, v) == VK_SUCCESS;
+}
 uint64_t vk_completed_seq(void) {
     uint64_t v = 0;
-    VK_CHECK(vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v));
+    if (seq_ptr) v = *seq_ptr;
+    else VK_CHECK(vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &v));
     done_note(v);
     return v;
+}
+// The marker reaching seq, polled: VK_TIMEOUT after timeout_ns
+static VkResult seq_poll(uint64_t seq, uint64_t timeout_ns) {
+    uint64_t t0 = SDL_GetTicksNS(), sl = 20000;
+    while (*seq_ptr < seq) {
+        if (SDL_GetTicksNS() - t0 >= timeout_ns) return VK_TIMEOUT;
+        struct timespec ts = {0, (long)sl};
+        nanosleep(&ts, NULL);
+        sl = sl * 2 < seq_sleep_max_ns ? sl * 2 : seq_sleep_max_ns;
+    }
+    return VK_SUCCESS;
+}
+bool vk_seq_wait_for(uint64_t seq, uint64_t timeout_ns) {
+    if (seq_ptr) return seq_poll(seq, timeout_ns) == VK_SUCCESS;
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
+                              .pValues = &seq};
+    return vkWaitSemaphores(g_vk.dev, &wi, timeout_ns) == VK_SUCCESS;
 }
 
 // The indirect draws whose parameters the GPU reads in place (draw_indirect), the last IR_N of them - always on, some
@@ -227,7 +266,7 @@ static void lost_report(uint64_t done) {
 static void ir_dump(void) {
     uint64_t done = 0;
     // (not VK_CHECK: the device may be lost - and then the value is UINT64_MAX or garbage: every entry is shown)
-    if (vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &done) != VK_SUCCESS || done > submit_seq) done = 0;
+    if (!seq_read(&done) || done > submit_seq) done = 0;
     unsigned lo = ir_n > IR_N ? ir_n - IR_N : 0, n = 0;
     for (unsigned k = lo; k < ir_n; k++) n += ir_ring[k & (IR_N - 1)].seq > done;
     lost_report(done);
@@ -267,7 +306,7 @@ static void cq_resolve_done(uint64_t done);
 
 void vk_wait_seq(uint64_t seq) {
     if (!seq) { wait_why = NULL; return; }
-    if (seq > rec_submitted()) {  // not handed to the driver yet: the recorder first (a timeline value can't be waited for sooner)
+    if (seq > rec_submitted()) {  // not handed to the driver yet: the recorder first (its completion can't be waited for sooner)
         pthread_mutex_lock(&seq_lock);
         uint64_t issued = submit_seq;
         pthread_mutex_unlock(&seq_lock);
@@ -279,12 +318,27 @@ void vk_wait_seq(uint64_t seq) {
         }
         rec_wait_submitted(seq);
     }
-    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
-                              .pValues = &seq};
     uint64_t t0 = SDL_GetTicksNS();
     extern void rq_watch(const char *what, uint64_t arg);
-    rq_watch("vkWaitSemaphores (GPU submission)", seq);
-    VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
+    VkResult r;
+    bool dumped = false;
+    if (seq_ptr) {
+        rq_watch("GPU wait (submission marker)", seq);
+        r = seq_poll(seq, 10ull * 1000000000ull);
+        if (r == VK_TIMEOUT) {  // a stuck GPU or a lost device: the queue's wait tells which
+            LOG("[vk] GPU did not finish submission %llu within 10 s: waiting for the queue\n", (unsigned long long)seq);
+            ir_dump();
+            dumped = true;
+            r = rec_queue_wait_idle();
+            if (r == VK_SUCCESS && *seq_ptr < seq) r = VK_TIMEOUT;
+            else if (r == VK_SUCCESS) LOG("[vk] submission %llu finished after all\n", (unsigned long long)seq);
+        }
+    } else {
+        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
+                                  .pValues = &seq};
+        rq_watch("vkWaitSemaphores (GPU submission)", seq);
+        r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
+    }
     rq_watch(NULL, 0);
     uint64_t waited = SDL_GetTicksNS() - t0;  // (the game thread's fence waits and the render thread's: atomic sums)
     __atomic_fetch_add(&stat_wait_ns, waited, __ATOMIC_RELAXED);
@@ -292,16 +346,16 @@ void vk_wait_seq(uint64_t seq) {
     wait_account(waited);
     // Callers recycle command buffers and allocations after this returns; a timeout is not completion.
     if (r == VK_TIMEOUT) {
-        ir_dump();
+        if (!dumped) ir_dump();
         FATAL("[vk] GPU did not finish submission %llu within 10 s; stopping before reusing in-flight resources\n",
               (unsigned long long)seq);
     } else if (r == VK_SUCCESS) done_note(seq), cq_resolve_done(seq);  // (the game reads its timing counters after waiting)
     else {
         extern void vk_devlost_dump(void);
-        ir_dump();
+        if (!dumped) ir_dump();
         vk_devlost_dump();
         vk_device_fault_report();
-        FATAL("vkWaitSemaphores: %d (device lost)\n", r);
+        FATAL("%s: %d (device lost)\n", seq_ptr ? "vkQueueWaitIdle" : "vkWaitSemaphores", r);
     }
 }
 
@@ -636,7 +690,7 @@ static void dl_note(const char *fmt, ...) {
 void vk_dl_note_upload(void *img, uint32_t w, uint32_t h, uint32_t lv) { dl_note("  upload %p %ux%u lv%u", img, w, h, lv); }
 void vk_devlost_dump(void) {
     uint64_t done = 0;  // (the recorder's path comes here without ir_dump)
-    if (vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &done) != VK_SUCCESS || done > submit_seq) done = 0;
+    if (!seq_read(&done) || done > submit_seq) done = 0;
     lost_report(done);
     if (!dl_on) return;
     LOG("[vk] last GPU operations before the device loss (oldest first):\n");
@@ -722,16 +776,28 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     if (s->ts_win && !s->ts_skip) s->ts_win = false;  // (not the window image's after all: counted as game work)
     gp_mark(s->main, "(submission end: the GPU idle until the next one starts)");
     if (s->ts) rec_CmdWriteTimestamp2(s->main, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, prof_qp, (uint32_t)cur_sub * 3 + 1);
+    if (seq_buf) {  // the completion marker (vk_completed_seq): after all of this submission's work, its writes host-visible
+        vk_full_barrier(s->main);
+        rec_CmdUpdateBuffer8(s->main, seq_buf, 0, submit_seq + 1);
+        VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                               .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
+                               .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+        rec_CmdPipelineBarrier2(s->main, &di);
+    }
     rec_EndCommandBuffer(s->main);
     cbs[n++] = (VkCommandBufferSubmitInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = s->main};
-    VkSemaphoreSubmitInfo sig[2] = {{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
-                                     .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
-                                    {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = signal,
-                                     .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT}};
-    VkSemaphoreSubmitInfo wt = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = wait,
-                                .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
+    VkSemaphoreSubmitInfo sig[2], wt = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = wait,
+                                        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT};
+    uint32_t nsig = 0;
+    if (!seq_ptr)  // (the marker on: not signalled)
+        sig[nsig++] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = g_vk.timeline,
+                                              .value = submit_seq + 1, .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
+    if (signal)
+        sig[nsig++] = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, .semaphore = signal,
+                                              .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2, .commandBufferInfoCount = (uint32_t)n, .pCommandBufferInfos = cbs,
-                        .signalSemaphoreInfoCount = signal ? 2 : 1, .pSignalSemaphoreInfos = sig,
+                        .signalSemaphoreInfoCount = nsig, .pSignalSemaphoreInfos = sig,
                         .waitSemaphoreInfoCount = wait ? 1 : 0, .pWaitSemaphoreInfos = &wt};
     dl_note("submit %llu", (unsigned long long)submit_seq + 1);
     subr_now.seq = submit_seq + 1, subr_now.ms = SDL_GetTicksNS() / 1000000;
@@ -741,7 +807,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     {   // (test) LARECOMP_TEST_LOST_REPORT=<submission>: what a device lost logs, without one
         static long at = -2;
         if (at == -2) at = ENV("LARECOMP_TEST_LOST_REPORT") ? atol(ENV("LARECOMP_TEST_LOST_REPORT")) : -1;
-        if (at > 0 && (long)subr_now.seq == at) { uint64_t d = 0; vkGetSemaphoreCounterValue(g_vk.dev, g_vk.timeline, &d); lost_report(d); }
+        if (at > 0 && (long)subr_now.seq == at) { uint64_t d = 0; seq_read(&d); lost_report(d); }
     }
     rec_QueueSubmit2(&si, submit_seq + 1);  // (the recorder: in order with the commands; its vkQueueSubmit2 time is in RecStats)
     pthread_mutex_lock(&seq_lock);
@@ -847,7 +913,7 @@ void renderer_wait_seq(uint64_t seq) {
         if (!seq) return;
     }
     if (overlap_on()) {  // (see deferred_seq) wait for the fence deferred last time, defer this one
-        uint64_t done = vk_completed_seq();  // (the timeline's value: a submission the recorder hasn't made yet isn't done)
+        uint64_t done = vk_completed_seq();  // (the marker's / timeline's value: a submission the recorder hasn't made yet isn't done)
         pthread_mutex_lock(&seq_lock);
         uint64_t w = overlap_defer(seq, done, &deferred_seq);
         pthread_mutex_unlock(&seq_lock);
@@ -1641,6 +1707,26 @@ void vk_exec_init(void) {
     }
     gpu_timer_on = prof_qp != VK_NULL_HANDLE;
     LOG("[vk] GPU timer %s (dynamic resolution goes by %s)\n", gpu_timer_on ? "on" : "off", gpu_timer_on ? "GPU time" : "frame times");
+    {   // the completion marker (seq_buf: LARECOMP_VK_SEQ_POLL=1), before any submission
+        const char *e = getenv("LARECOMP_VK_SEQ_POLL"), *us = getenv("LARECOMP_VK_SEQ_POLL_US");
+        if (us && atoi(us) > 20) seq_sleep_max_ns = (uint64_t)atoi(us) * 1000;
+        if (e && atoi(e) == 1) {
+            VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 64, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+            VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST, .requiredFlags = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                          .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+            VmaAllocationInfo info;
+            if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &seq_buf, &seq_mem, &info) == VK_SUCCESS && info.pMappedData) {
+                seq_ptr = info.pMappedData;
+                *seq_ptr = submit_seq;
+                LOG("[vk] GPU completion: a marker each submission writes, polled (up to %llu us sleeps); timeline not signalled\n",
+                    (unsigned long long)(seq_sleep_max_ns / 1000));
+            } else {
+                if (seq_buf) vmaDestroyBuffer(g_vk.vma, seq_buf, seq_mem);
+                seq_buf = VK_NULL_HANDLE;
+                LOG("[vk] no completion marker buffer: GPU completion through the timeline semaphore\n");
+            }
+        }
+    }
     st_defaults();
     // The heap's chunk / lazy decision now, on this thread, before the render thread and the build workers exist:
     // they read gc_shift / gc_lazy directly (a buffer copy can come before any shader was translated)

@@ -31,11 +31,11 @@
 //   the queue           R's alone (submissions, presents); T uses it only after rec_drain (vkDeviceWaitIdle,
 //                       the heap import probe), when R is idle and nothing is queued
 //   Vulkan objects in   images, views, buffers, samplers, pipelines, layouts, query pools: created by T (or the build
-//   packets             workers) before the packet that names them; destroyed by T only once vkWaitSemaphores /
+//   packets             workers) before the packet that names them; destroyed by T only once vk_wait_seq /
 //                       vk_completed_seq says the submission that could use them is done - which implies R
 //                       submitted it, which implies R recorded every packet before that submission (packets run
-//                       in order, the timeline is signalled by the submission). So "destroy once the GPU is done"
-//                       stays correct with the recorder in between
+//                       in order, the submission writes its completion marker / signals the timeline). So "destroy
+//                       once the GPU is done" stays correct with the recorder in between
 //   the transient ring  exec.c's chunks: written by T (the data) and reused by T once their submission completed
 //                       (the same argument); R only passes buffer handles and offsets through
 //   stats               RecStats: T's fields plain (one writer), R's _Atomic relaxed adds; read by T
@@ -251,6 +251,12 @@ static void slow_wait(const char *what, uint64_t ns) {
 }
 
 uint64_t rec_submitted(void) { return atomic_load_explicit(&submitted, memory_order_acquire); }
+VkResult rec_queue_wait_idle(void) {
+    pthread_mutex_lock(&queue_mu);
+    VkResult r = vkQueueWaitIdle(g_vk.queue);
+    pthread_mutex_unlock(&queue_mu);
+    return r;
+}
 uint64_t rec_presents_queued(void) { return presents_queued; }
 
 void rec_wait_submitted(uint64_t seq) {
@@ -676,9 +682,7 @@ static void *late_main(void *arg) {
         while (!late_have) pthread_cond_wait(&late_cv, &late_mu);
         PresentArgs a = late_a;
         pthread_mutex_unlock(&late_mu);
-        VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
-                                  .pValues = &a.after};
-        vkWaitSemaphores(g_vk.dev, &wi, 200000000ull);  // (a device loss shows up in the next present)
+        vk_seq_wait_for(a.after, 200000000ull);  // (a device loss shows up in the next present)
         uint64_t t = NOW();
         if (a.gid) {
             // On the display's refresh grid: the compositor shows the in-between image (present gid - 1) on the first
@@ -720,9 +724,7 @@ static void present_run(const void *p) {
     const PresentArgs *a = p;
     if (!a->after || on <= 0) {
         if (a->after) {  // (no recorder: this thread waits)
-            VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1,
-                                      .pSemaphores = &g_vk.timeline, .pValues = &a->after};
-            vkWaitSemaphores(g_vk.dev, &wi, 200000000ull);
+            vk_seq_wait_for(a->after, 200000000ull);
             PresentArgs b = *a;
             b.after = 0;  // (counted by present_now)
             if (b.gid) b.desired = NOW() + b.delay;
@@ -940,6 +942,17 @@ CMD_ARGS(CmdWriteTimestamp2, VkPipelineStageFlags2 stage; VkQueryPool pool; uint
 static void CmdWriteTimestamp2_run(const void *p) { const CmdWriteTimestamp2Args *a = p; vkCmdWriteTimestamp2(a->cb, a->stage, a->pool, a->query); }
 void rec_CmdWriteTimestamp2(VkCommandBuffer cb, VkPipelineStageFlags2 stage, VkQueryPool pool, uint32_t query) {
     CMD_QUEUE(CmdWriteTimestamp2, cb, stage, pool, query);
+}
+
+CMD_ARGS(CmdUpdateBuffer, VkBuffer buf; VkDeviceSize off; uint64_t v;)
+static void CmdUpdateBuffer_run(const void *p) { const CmdUpdateBufferArgs *a = p; vkCmdUpdateBuffer(a->cb, a->buf, a->off, sizeof a->v, &a->v); }
+void rec_CmdUpdateBuffer8(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, uint64_t v) {
+    if (on <= 0) { vkCmdUpdateBuffer(cb, buf, off, sizeof v, &v); return; }
+    ENQ_T0();
+    CmdUpdateBufferArgs *a = push(CmdUpdateBuffer_run, sizeof *a, 0);
+    *a = (CmdUpdateBufferArgs){cb, buf, off, v};
+    commit();
+    ENQ_END();
 }
 
 CMD_ARGS(CmdSetBlendConstants, float c[4];)
