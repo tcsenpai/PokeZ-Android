@@ -26,6 +26,8 @@ mkdir -p "$APP/app/src/main/java/$PKGDIR" "$JNI"
 # library and drives the Android lifecycle
 cp -R "$SDLT/app/src/main/java/org" "$APP/app/src/main/java/"
 cp -R "$SDLT/app/src/main/res" "$APP/app/src/main/"
+# our launcher icon over SDL's (icon/make_icon.py draws it)
+cp -R "$(dirname "$0")/icon/res/." "$APP/app/src/main/res/"
 cp -R "$SDLT/gradle" "$APP/"
 cp "$SDLT/gradlew" "$SDLT/gradlew.bat" "$APP/"
 chmod +x "$APP/gradlew"
