@@ -151,21 +151,34 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBi
 #include <adrenotools/driver.h>
 #include <dlfcn.h>
 #include <libgen.h>
-// Thor experiment: Vulkan through Mesa Turnip (packaged as libvulkan_turnip.so beside libmain.so), loaded with
-// libadrenotools onto the system loader. LARECOMP_DRIVER=system: the phone's own driver (through volk as well).
+// Thor: Vulkan through a custom driver, loaded with libadrenotools onto the system loader. LARECOMP_DRIVER:
+//   unset            libvulkan_turnip.so packaged beside libmain.so (Mesa Turnip);
+//   <name>.so        that file beside libmain.so;
+//   /abs/dir/<f>.so  a driver package unpacked in the app's internal storage (a Qualcomm package with its
+//                    not*.so libraries, or any Turnip build: no repackaging to try one);
+//   system           the phone's own driver (through volk as well).
+// LARECOMP_GPU_TURBO=1: libadrenotools' KGSL turbo (GPU at its top clock; thermal limits still apply).
 static void *custom_vulkan;
 static PFN_vkGetInstanceProcAddr custom_driver(void) {
     const char *want = getenv("LARECOMP_DRIVER");
+    if (getenv("LARECOMP_GPU_TURBO") && atoi(getenv("LARECOMP_GPU_TURBO"))) {
+        adrenotools_set_turbo(true);
+        LOG("[vk] GPU turbo on (libadrenotools)\n");
+    }
     Dl_info di;
     if ((want && !strcmp(want, "system")) || !dladdr((void *)custom_driver, &di) || !di.dli_fname) return NULL;
-    char dir[1100], drv[1200];
-    snprintf(dir, sizeof dir, "%s/", dirname(strdup(di.dli_fname)));
+    char libdir[1100], drvdir[1100], drv[1200];
+    snprintf(libdir, sizeof libdir, "%s/", dirname(strdup(di.dli_fname)));
     const char *name = want && *want ? want : "libvulkan_turnip.so";
-    snprintf(drv, sizeof drv, "%s%s", dir, name);
+    snprintf(drvdir, sizeof drvdir, "%s", libdir);
+    const char *slash = strrchr(name, '/');
+    if (slash) snprintf(drvdir, sizeof drvdir, "%.*s", (int)(slash - name + 1), name), name = slash + 1;
+    snprintf(drv, sizeof drv, "%s%s", drvdir, name);
     if (access(drv, R_OK) != 0) { LOG("[vk] driver %s: missing, the system's instead\n", drv); return NULL; }
-    custom_vulkan = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, NULL, dir, dir, name, NULL, NULL);
+    custom_vulkan = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, NULL, libdir, drvdir, name, NULL, NULL);
     PFN_vkGetInstanceProcAddr gipa = custom_vulkan ? (PFN_vkGetInstanceProcAddr)dlsym(custom_vulkan, "vkGetInstanceProcAddr") : NULL;
     LOG("[vk] driver %s: %s\n", drv, gipa ? "loaded (libadrenotools)" : "failed, the system's instead");
+    if (!gipa) custom_vulkan = NULL;
     return gipa;
 }
 #endif
@@ -631,6 +644,44 @@ bool vk_compile_crash_recover(uint64_t pc, const char *what, uint64_t fa) {
     return vk_compile_abandon();
 }
 
+// LARECOMP_VK_EXEC_STATS=1: the driver compiler's statistics for one pipeline built with CAPTURE_STATISTICS, one line a
+// shader ("[stats] <what> <code> <code> | <stage>: <name>=<value> ..."): instruction counts, registers, spills.
+bool g_vk_exec_stats;
+void vk_exec_stats_log(VkPipeline pipe, const char *what, uint64_t c0, uint64_t c1) {
+    if (!g_vk_exec_stats || !pipe) return;
+    static PFN_vkGetPipelineExecutablePropertiesKHR props;
+    static PFN_vkGetPipelineExecutableStatisticsKHR stats;
+    if (!props) {
+        props = (PFN_vkGetPipelineExecutablePropertiesKHR)vkGetDeviceProcAddr(g_vk.dev, "vkGetPipelineExecutablePropertiesKHR");
+        stats = (PFN_vkGetPipelineExecutableStatisticsKHR)vkGetDeviceProcAddr(g_vk.dev, "vkGetPipelineExecutableStatisticsKHR");
+        if (!props || !stats) { g_vk_exec_stats = false; return; }
+    }
+    VkPipelineInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR, .pipeline = pipe};
+    VkPipelineExecutablePropertiesKHR ep[8];
+    uint32_t ne = 8;
+    for (uint32_t i = 0; i < ne; i++) ep[i] = (VkPipelineExecutablePropertiesKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR};
+    if (props(g_vk.dev, &pi, &ne, ep) < 0) return;
+    for (uint32_t e = 0; e < ne; e++) {
+        VkPipelineExecutableStatisticKHR st[48];
+        uint32_t ns = 48;
+        for (uint32_t i = 0; i < ns; i++) st[i] = (VkPipelineExecutableStatisticKHR){.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR};
+        VkPipelineExecutableInfoKHR xi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR, .pipeline = pipe, .executableIndex = e};
+        if (stats(g_vk.dev, &xi, &ns, st) < 0) continue;
+        char line[1800];
+        int n = snprintf(line, sizeof line, "[stats] %s %llx %llx | %s:", what, (unsigned long long)c0, (unsigned long long)c1, ep[e].name);
+        for (uint32_t i = 0; i < ns && n < (int)sizeof line - 64; i++) {
+            const VkPipelineExecutableStatisticKHR *s = &st[i];
+            switch (s->format) {
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR: n += snprintf(line + n, sizeof line - n, " %s=%u", s->name, s->value.b32); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR: n += snprintf(line + n, sizeof line - n, " %s=%lld", s->name, (long long)s->value.i64); break;
+            case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR: n += snprintf(line + n, sizeof line - n, " %s=%llu", s->name, (unsigned long long)s->value.u64); break;
+            default: n += snprintf(line + n, sizeof line - n, " %s=%g", s->name, s->value.f64); break;
+            }
+        }
+        LOG("%s\n", line);
+    }
+}
+
 void vk_device_fault_report(void) {
     static int once;
     if (once++ || !g_fault_ext) return;
@@ -698,10 +749,14 @@ static void pipeline_cache_tag(char *out, size_t n) {
     shader_cache_tag(out, n, gpu);
 }
 
-static void *pipeline_cache_saver(void *a) {  // every 3 minutes, when it grew
+// Every 30 s when it grew (EoWRecomp's interval; it was 3 minutes): an app is killed far more often than it quits, and
+// what a kill loses is every pipeline built since the last save. LARECOMP_PCACHE_SAVE_S=<s>: another interval.
+static void *pipeline_cache_saver(void *a) {
     (void)a;
+    const char *e = getenv("LARECOMP_PCACHE_SAVE_S");
+    Uint32 ms = e && atoi(e) > 0 ? (Uint32)atoi(e) * 1000 : 30000;
     for (;;) {
-        SDL_Delay(180000);
+        SDL_Delay(ms);
         if (rq_stopping()) break;  // (quitting: backend_quit saves it)
         vk_pipeline_cache_save();
     }
@@ -801,6 +856,9 @@ static void create_device(void) {
     // Whether the window really shows the frames presented (present_watch). LARECOMP_NO_PRESENT_WATCH=1: not checked
     bool x_pw = !ENV("LARECOMP_NO_PRESENT_WATCH") && has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
                 has_ext(ep, ne, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+    // LARECOMP_VK_EXEC_STATS=1 (debug): the driver's compiler statistics for every pipeline (instructions, registers,
+    // spills: VK_KHR_pipeline_executable_properties), "[stats]" lines after each build (vk_exec_stats_log)
+    bool x_xs = ENV("LARECOMP_VK_EXEC_STATS") && has_ext(ep, ne, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
@@ -928,6 +986,14 @@ static void create_device(void) {
     const char *ga = getenv("LARECOMP_VK_GMEM_ADDR");
     g_vk.gmem_addr = (ga ? atoi(ga) != 0 : g_vk.props.vendorID == 0x1002) && have12.bufferDeviceAddress && g_vk.host_import;
     g_vk.bda |= g_vk.gmem_addr;
+    {   // (Android) LARECOMP_VK_GMEM_BDA=1/0: guest memory through the AHardwareBuffer's device address (vk.h gmem_bda)
+        const char *gb = getenv("LARECOMP_VK_GMEM_BDA");
+        g_vk.gmem_bda = g_vk.ahb_import && have12.bufferDeviceAddress && gb && atoi(gb) != 0;
+        g_vk.bda |= g_vk.gmem_bda;
+        if (g_vk.ahb_import)
+            LOG("[vk] guest memory in shaders: %s (maxStorageBufferRange %u MB)\n",
+                g_vk.gmem_bda ? "buffer device address" : "one storage buffer", g_vk.props.limits.maxStorageBufferRange >> 20);
+    }
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
         .vertexAttributeInstanceRateDivisor = VK_TRUE, .vertexAttributeInstanceRateZeroDivisor = VK_FALSE};
@@ -1001,6 +1067,13 @@ static void create_device(void) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT, .graphicsPipelineLibrary = VK_TRUE};
     if (g_vk.gpl_probe) en_gpl.pNext = f.pNext, f.pNext = &en_gpl;
 #endif
+    VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR en_xs = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR, .pipelineExecutableInfo = VK_TRUE};
+    if (x_xs) {
+        en_xs.pNext = f.pNext, f.pNext = &en_xs;
+        ext[n_ext++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
+        g_vk_exec_stats = true;
+    }
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
     b->independentBlend = h->independentBlend;
     b->drawIndirectFirstInstance = h->drawIndirectFirstInstance;  // (the game's GPU-culled draws start past instance 0: GPU-AV)
@@ -1142,6 +1215,7 @@ void vk_pipeline_cache_save(void) {
     static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&lock);
     size_t sz = 0;
+    uint64_t t0 = plat_now_ns();
     if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) == VK_SUCCESS && sz && sz != pcache_saved) {
         void *data = malloc(sz);
         if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) == VK_SUCCESS && shader_cache_write(PCACHE_FILE, data, sz)) {
@@ -1149,7 +1223,7 @@ void vk_pipeline_cache_save(void) {
             pipeline_cache_tag(tag, sizeof tag);
             if (!shader_cache_tag_ok(PCACHE_TAG, tag)) shader_cache_tag_write(PCACHE_TAG, tag);
             pcache_saved = sz;
-            LOG("[vk] pipeline cache: saved %zu bytes\n", sz);
+            LOG("[vk] pipeline cache: saved %zu bytes (%.1f ms)\n", sz, (plat_now_ns() - t0) / 1e6);
         }
         free(data);
     }
@@ -2090,8 +2164,9 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         bool at30 = fg_period > 25 && fg_period < 45 && d < fg_period * 1.6;
         extern TexBackend *vk_fg_make(TexBackend *b, uint64_t frame, bool make);
         if (g_settings.frame_gen) fg_mid = vk_fg_make(b, frame, at30);
-        // (the display at 60 or more for 60 images a second: left to itself the phone went down to 30 Hz with the game)
-        plat_frame_rate_hint(window, g_settings.fps45 ? 90.0f : g_settings.frame_gen || g_settings.fps60 ? 60.0f : 0.0f);
+        // (the display at 60 or more for 60 images a second: left to itself the phone went down to 30 Hz with the game;
+        // at 30 the 30 too, so a 60/120 Hz panel shows every image on the same vsync phase - android.c, LARECOMP_DISPLAY_RATE)
+        plat_frame_rate_hint(window, g_settings.fps45 ? 90.0f : g_settings.frame_gen || g_settings.fps60 ? 60.0f : 30.0f);
         static int tm = -1;
         if (tm < 0) tm = ENV("LARECOMP_FG_TIMING") != NULL;
         if (tm && g_settings.frame_gen) {  // (how many frames had an in-between image, and why not)

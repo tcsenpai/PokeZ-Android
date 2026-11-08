@@ -125,6 +125,13 @@ extern bool maxwell_gmem_lazy;
 // runtime sets it before the first translation (Vulkan: off on AMD GPUs, exec.c vk_exec_init).
 extern bool maxwell_flat_default;
 extern bool maxwell_quad_ops;
+// GLSL with 64-bit integer types (carry chains, funnel shifts, global addresses) - true - or only 32-bit pairs with
+// explicit carries - false: a device without shaderInt64 (Qualcomm's own driver). Set before the first translation.
+extern bool maxwell_int64;
+// One-buffer mode (no chunks): the guest window through its device address - a uniform buffer at GMEM_BUFFER_INDEX
+// holding it (uvec4 gma: x, y the address) and a buffer reference - instead of a storage buffer over it (Android:
+// the window is past the GPU's maxStorageBufferRange). Set before the first translation (exec.c vk_exec_init).
+extern bool maxwell_gmem_bda;
 // Lazy mode, fragment: a shader without discard / depth output / stores declares early fragment tests (its GMiss
 // atomics would turn them off); one with discard / depth output (no stores) counts no misses - the
 // runtime imports the bound storage buffers' chunks before the draw. true (LARECOMP_VK_GMEM_FS_MISS=1): every shader

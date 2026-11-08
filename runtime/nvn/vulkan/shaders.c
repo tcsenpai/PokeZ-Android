@@ -1729,6 +1729,25 @@ static const char *builtin_src(const char *name, int *stage) {
                "  if (v != w && (pc.cpu_wins == 0u || h[pc.dst + i] == w)) h[pc.dst + i] = v;\n"
                "}\n";
     }
+    // (the same, the heap by its device address: vk.h gmem_bda - the window is past maxStorageBufferRange)
+    if (!strcmp(name, "gfast_merge_bda.comp")) {
+        *stage = STAGE_COMPUTE;
+        return "#version 450\n"
+               "#extension GL_EXT_buffer_reference : require\n"
+               "#extension GL_EXT_buffer_reference_uvec2 : require\n"
+               "layout(local_size_x = 256) in;\n"
+               "layout(buffer_reference, std430, buffer_reference_align = 4) buffer H { uint h[]; };\n"
+               "layout(std430, set = 0, binding = 1) readonly buffer F { uint f[]; };\n"
+               "layout(std430, set = 0, binding = 2) readonly buffer O { uint o[]; };\n"
+               "layout(push_constant) uniform P { uint src; uint dst; uint n; uint cpu_wins; uvec2 heap; } pc;\n"
+               "void main() {\n"
+               "  uint i = gl_GlobalInvocationID.x;\n"
+               "  if (i >= pc.n) return;\n"
+               "  H hp = H(pc.heap);\n"
+               "  uint v = f[pc.src + i], w = o[pc.src + i];\n"
+               "  if (v != w && (pc.cpu_wins == 0u || hp.h[pc.dst + i] == w)) hp.h[pc.dst + i] = v;\n"
+               "}\n";
+    }
     return NULL;
 }
 

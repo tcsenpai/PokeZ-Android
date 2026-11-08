@@ -1313,17 +1313,28 @@ static void skip_log(void) {
 #define BUILDS_MAX 64
 static pthread_mutex_t builds_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct { const char *what; uint64_t c0, c1, t0; bool logged; } builds[BUILDS_MAX];
+// LARECOMP_LOG_BUILDS=1 (debug): every build's start and end ("[build] +" / "[build] -"): a driver compiler crash leaves
+// its pipeline as a "+" with no "-".
+static bool log_builds(void) {
+    static int on = -1;
+    if (on < 0) on = ENV("LARECOMP_LOG_BUILDS") != NULL;
+    return on;
+}
 static int build_begin(const char *what, uint64_t c0, uint64_t c1) {
     pthread_mutex_lock(&builds_lock);
     int s = 0;
     while (s < BUILDS_MAX && builds[s].what) s++;
     if (s < BUILDS_MAX) { builds[s].what = what; builds[s].c0 = c0; builds[s].c1 = c1; builds[s].t0 = SDL_GetTicksNS(); builds[s].logged = false; }
     pthread_mutex_unlock(&builds_lock);
+    if (log_builds()) LOG("[build] + %d %s %llx %llx (thread %llu)\n", s, what, (unsigned long long)c0, (unsigned long long)c1,
+                          (unsigned long long)SDL_GetCurrentThreadID());
     return s < BUILDS_MAX ? s : -1;
 }
 static void build_end(int s) {
     if (s < 0) return;
     pthread_mutex_lock(&builds_lock);
+    if (log_builds()) LOG("[build] - %d %s %llx %llx %llu ms\n", s, builds[s].what, (unsigned long long)builds[s].c0,
+                          (unsigned long long)builds[s].c1, (unsigned long long)((SDL_GetTicksNS() - builds[s].t0) / 1000000));
     builds[s].what = NULL;
     pthread_mutex_unlock(&builds_lock);
 }
@@ -1530,6 +1541,16 @@ void vk_exec_init(void) {
     vkGetPhysicalDeviceProperties2(g_vk.phys, &pr2);
     maxwell_quad_ops = (sg.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT) && (sg.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT);
     LOG("[vk] subgroups: %u lanes, quad operations in fragment shaders: %s\n", sg.subgroupSize, maxwell_quad_ops ? "yes" : "no");
+    {   // 64-bit integers in translated shaders (carry chains, funnel shifts, global addresses) only where the device has
+        // shaderInt64: else (Qualcomm's own driver) 32-bit pairs with explicit carries. LARECOMP_VK_INT64=0/1 forces it.
+        VkPhysicalDeviceFeatures fe;
+        vkGetPhysicalDeviceFeatures(g_vk.phys, &fe);
+        const char *ie = getenv("LARECOMP_VK_INT64");
+        maxwell_int64 = ie && *ie ? atoi(ie) != 0 : fe.shaderInt64 != 0;
+        LOG("[vk] shader 64-bit integer math: %s (device shaderInt64 %d%s)\n", maxwell_int64 ? "native" : "32-bit pairs",
+            fe.shaderInt64, ie && *ie ? ", LARECOMP_VK_INT64" : "");
+    }
+    maxwell_gmem_bda = g_vk.gmem_bda;  // (device.c: the Android window through its device address)
     if (!getenv("LARECOMP_SHADER_FLAT") && !maxwell_flat_default)
         LOG("[vk] straight-line shader form off (%s; LARECOMP_SHADER_FLAT=1: on)\n",
             fcs == GPU_OFF ? "F1 > Compatibility" : "this AMD GPU, F1 > Compatibility to turn it on");
@@ -2627,11 +2648,20 @@ static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, V
 
 static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
     if (!ENV("LARECOMP_SAVE_MSL")) return;
+    mkdir("build", 0755);
     mkdir("build/glsl", 0755);
     char path[256];
     snprintf(path, sizeof path, "build/glsl/%llx_%s.glsl", (unsigned long long)addr, suffix);
     FILE *f = fopen(path, "w");
     if (f) { fputs(src, f); fclose(f); }
+}
+// (with LARECOMP_SAVE_MSL) the SPIR-V the driver is given, beside its GLSL: build/glsl/<code address>_<stage>.spv
+static void save_spv(const uint32_t *spv, size_t nwords, uint64_t addr, const char *suffix) {
+    if (!ENV("LARECOMP_SAVE_MSL") || !spv) return;
+    char path[256];
+    snprintf(path, sizeof path, "build/glsl/%llx_%s.spv", (unsigned long long)addr, suffix);
+    FILE *f = fopen(path, "wb");
+    if (f) { fwrite(spv, 4, nwords, f); fclose(f); }
 }
 
 void slow_note_build(const char *what, uint64_t ns);  // (slowframe.h: the slow-frame log's counts; every build,
@@ -2681,6 +2711,8 @@ static void compile_program(void *arg) {
     if (!sv || !sf) { free(sv); free(sf); atomic_store(&p->state, 2); build_end(bs); return; }
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
     p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
+    save_spv(sv, nv, p->code[0] ? p->code[0] : p->prep_vh, "vs");
+    save_spv(sf, nf, p->code[1] ? p->code[1] : p->prep_fh, "fs");
     p->vs = vk_module(sv, nv);
     p->fs = vk_module(sf, nf);
     if (spirv_strip_early_tests(sf, &nf)) p->fs_late = vk_module(sf, nf);
@@ -3431,6 +3463,9 @@ static void build_pipeline(void *arg) {
     extern bool g_vk_no_opt;  // (device.c vk_bad_code_note: this driver's optimizer gave the GPU invalid instructions)
     extern __thread uint64_t t_build_vs, t_build_fs;
     if (g_vk_no_opt) c.pi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    extern bool g_vk_exec_stats;  // (device.c vk_exec_stats_log: LARECOMP_VK_EXEC_STATS)
+    extern void vk_exec_stats_log(VkPipeline pipe, const char *what, uint64_t c0, uint64_t c1);
+    if (g_vk_exec_stats) c.pi.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     t_build_vs = k->prog->hash[0], t_build_fs = k->prog->hash[1];
     t_build_state = &pp->state, t_build_slot = bs;
     {   // (test) LARECOMP_TEST_COMPILE_CRASH=<n>: the n-th pipeline fails as a compiler crash would
@@ -3444,6 +3479,9 @@ static void build_pipeline(void *arg) {
     t_build_state = NULL;
     SLOW_FEEDBACK_HIT();
     build_end(bs);
+    if (r == VK_SUCCESS)
+        vk_exec_stats_log(pp->pipe, "gfx", k->prog->code[0] ? k->prog->code[0] : k->prog->prep_vh,
+                          k->prog->code[1] ? k->prog->code[1] : k->prog->prep_fh);
     {   // (how much of the session's pipeline time is the driver's: every 200, with the driver's cache hits)
         static _Atomic uint64_t ns, count, hits;
         uint64_t c_ = atomic_fetch_add(&count, 1) + 1, n_ = atomic_fetch_add(&ns, SDL_GetTicksNS() - t0) + (SDL_GetTicksNS() - t0);
@@ -4677,7 +4715,8 @@ static VkResult ahb_import(uint64_t addr, uint64_t size, VkBuffer *out_buf, VkDe
                                            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID};
     VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = size,
                              .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT};
+                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                                      (g_vk.gmem_bda ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0)};
     VkBuffer buf;
     if ((r = vkCreateBuffer(g_vk.dev, &bi, NULL, &buf)) != VK_SUCCESS) return r;
     VkMemoryRequirements rq;
@@ -4689,7 +4728,10 @@ static VkResult ahb_import(uint64_t addr, uint64_t size, VkBuffer *out_buf, VkDe
     for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
         if ((bits >> i & 1) && (mp.memoryTypes[i].propertyFlags & coh) == coh) { type = i; break; }
     VkImportAndroidHardwareBufferInfoANDROID imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID, .buffer = ahb};
-    VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, .pNext = &imp, .buffer = buf};
+    VkMemoryAllocateFlagsInfo fl = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, .pNext = &imp,
+                                    .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT};
+    VkMemoryDedicatedAllocateInfo ded = {.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+                                         .pNext = g_vk.gmem_bda ? (void *)&fl : (void *)&imp, .buffer = buf};
     VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &ded, .allocationSize = ap.allocationSize,
                                .memoryTypeIndex = type};
     VkDeviceMemory mem;
@@ -4997,10 +5039,42 @@ static VkDescriptorBufferInfo gmem_info(void) {
         LOG("[vk] guest heap import failed (%llu MB): shader global memory reads return zero\n", (unsigned long long)(want >> 20));
         off = 1;
     }
-    if (gmem_buf) return (VkDescriptorBufferInfo){gmem_buf, 0, gmem_size};
+    if (gmem_buf) {  // (by device address, nothing reads the storage buffer view: kept within the limit, to be valid)
+        uint64_t lim = g_vk.props.limits.maxStorageBufferRange;
+        return (VkDescriptorBufferInfo){gmem_buf, 0, g_vk.gmem_bda && lim && gmem_size > lim ? lim : gmem_size};
+    }
     static uint32_t zero[1024];
     VkSpan s = vk_transient_copy(zero, sizeof zero, 256);
     return (VkDescriptorBufferInfo){s.buf, s.off, sizeof zero};
+}
+
+// (g_vk.gmem_bda, shader.h maxwell_gmem_bda) The uniform buffer at GMEM_BUFFER_INDEX: the window import's device
+// address (x, y), which the shaders turn into a buffer reference. Imports on first use, as gmem_info.
+static uint64_t gmem_va;
+static VkDescriptorBufferInfo gmem_bda_info(void) {
+    static VkBuffer ubuf, for_buf;
+    static VmaAllocation umem;
+    static uint32_t *umap;
+    gmem_info();
+    if (!ubuf) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 256, .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+        VmaAllocationInfo inf;
+        VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &ubuf, &umem, &inf));
+        umap = inf.pMappedData;
+    }
+    if (for_buf != gmem_buf) {  // (a new import: its address)
+        if (!gmem_buf) FATAL("guest memory by device address, but no import of it (LARECOMP_VK_GMEM_BDA=0: one storage buffer)\n");
+        VkBufferDeviceAddressInfo ai = {.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, .buffer = gmem_buf};
+        gmem_va = vkGetBufferDeviceAddress(g_vk.dev, &ai);
+        uint32_t v[4] = {(uint32_t)gmem_va, (uint32_t)(gmem_va >> 32), (uint32_t)gmem_size, 0};
+        memcpy(umap, v, sizeof v);
+        vmaFlushAllocation(g_vk.vma, umem, 0, VK_WHOLE_SIZE);
+        for_buf = gmem_buf;
+        LOG("[vk] guest window by device address %#llx (%llu MB)\n", (unsigned long long)gmem_va, (unsigned long long)(gmem_size >> 20));
+    }
+    return (VkDescriptorBufferInfo){ubuf, 0, 16};
 }
 
 // ---- the guest heap for shaders in chunks (shader.h maxwell_gmem_chunk_shift)
@@ -5547,14 +5621,15 @@ static bool gmerge_init(void) {
                                               .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
     VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = b};
     VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &gmerge_set_layout));
-    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+    VkPushConstantRange pr = {VK_SHADER_STAGE_COMPUTE_BIT, 0, 32};  // (+ the heap's device address: gfast_merge_bda.comp)
     VkPipelineLayoutCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                      .pSetLayouts = &gmerge_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
     VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &pi, NULL, &gmerge_layout));
     VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, .layout = gmerge_layout,
                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                                                .module = vk_builtin_shader("gfast_merge.comp"), .pName = "main"}};
+                                                .module = vk_builtin_shader(g_vk.gmem_bda ? "gfast_merge_bda.comp" : "gfast_merge.comp"),
+                                                .pName = "main"}};
     VK_CHECK(vkCreateComputePipelines(g_vk.dev, VK_NULL_HANDLE, 1, &ci, NULL, &gmerge_pipe));
     return true;
 }
@@ -5797,6 +5872,7 @@ static void gfast_finish(VkCommandBuffer cb) {
     if (merged) {
         VkDescriptorSet set = vk_alloc_set(gmerge_set_layout);
         VkDescriptorBufferInfo bi[3] = {gmem_info(), {gfast_buf, 0, GFAST_SIZE}, {gorig_buf, 0, GFAST_SIZE}};
+        if (g_vk.gmem_bda) gmem_bda_info();  // (gmem_va current)
         VkWriteDescriptorSet w[3];  // (one descriptor a write: record.c)
         for (uint32_t k = 0; k < 3; k++)
             w[k] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = k,
@@ -5807,8 +5883,8 @@ static void gfast_finish(VkCommandBuffer cb) {
         for (int i = 0; i < gfast_back_n; i++) {
             static int cpu_wins = -1;  // (gfast_merge.comp: a word both rewrote keeps the CPU's; LARECOMP_VK_GFAST_CPU_WINS=0: the dispatch's)
             if (cpu_wins < 0) cpu_wins = !ENV("LARECOMP_VK_GFAST_CPU_WINS") || atoi(ENV("LARECOMP_VK_GFAST_CPU_WINS")) != 0;
-            uint32_t pc[4] = {(uint32_t)(gfast_back[i].srcOffset / 4), (uint32_t)(gfast_back[i].dstOffset / 4), (uint32_t)(gfast_back[i].size / 4),
-                              (uint32_t)cpu_wins};
+            uint32_t pc[8] = {(uint32_t)(gfast_back[i].srcOffset / 4), (uint32_t)(gfast_back[i].dstOffset / 4), (uint32_t)(gfast_back[i].size / 4),
+                              (uint32_t)cpu_wins, (uint32_t)gmem_va, (uint32_t)(gmem_va >> 32), 0, 0};
             rec_CmdPushConstants(cb, gmerge_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
             rec_CmdDispatch(cb, (pc[2] + 255) / 256, 1, 1);
         }
@@ -6384,6 +6460,9 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         } else if (is_ubo(b->type) && b->binding < 17) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
             w[n].pBufferInfo = &bi[n];
+        } else if (is_ubo(b->type) && b->binding == GMEM_BUFFER_INDEX) {  // (maxwell_gmem_bda: the window's address)
+            bi[n] = gmem_bda_info();
+            w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
             bi[n] = b->binding == GFAST_BUFFER_INDEX ? gfast_info()
                   : b->binding == XFB_BUFFER_INDEX && xm_draw ? (VkDescriptorBufferInfo){xm_buf, 0, XM_SIZE} : gmem_info();
@@ -6491,6 +6570,8 @@ static void build_compute(void *arg) {
     uint32_t *spv = vk_glsl_to_spirv(cp->si->msl, STAGE_COMPUTE, "cs", &n);
     if (!spv) { atomic_store(&cp->p.state, 2); build_end(bs); return; }
     cp->p.nbinds = vk_reflect(spv, n, cp->p.binds, MAX_BIND);
+    save_glsl(cp->si->msl, cp->code, "cs");
+    save_spv(spv, n, cp->code, "cs");
     VkShaderModule m = vk_module(spv, n);
     free(spv);
     if (!m) {
@@ -6512,7 +6593,11 @@ static void build_compute(void *arg) {
     SLOW_FEEDBACK(ci);
     extern bool g_vk_no_opt;
     if (g_vk_no_opt) ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+    extern bool g_vk_exec_stats;
+    extern void vk_exec_stats_log(VkPipeline pipe, const char *what, uint64_t c0, uint64_t c1);
+    if (g_vk_exec_stats) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
+    if (r == VK_SUCCESS) vk_exec_stats_log(cp->pipe, "cs", cp->code, 0);
     SLOW_FEEDBACK_HIT();
     atomic_fetch_add(&stat_compiles, 1);
     atomic_fetch_add(&builds_done, 1);
