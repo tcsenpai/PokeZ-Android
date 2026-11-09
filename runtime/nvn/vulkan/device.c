@@ -1266,6 +1266,39 @@ static VkPresentModeKHR present_mode(void) {
 static bool hdr_blocked;  // (create_swapchain: Android pre-rotation has no HDR pass)
 static bool hdr_wanted(void) { return g_vk.hdr_capable && g_settings.hdr && !ENV("LARECOMP_NO_HDR") && !hdr_blocked; }
 
+// The window's Vulkan surface. Android destroys the window's surface when the app goes to the background and makes a
+// new one when it comes back: the old VkSurfaceKHR then only says VK_ERROR_SURFACE_LOST_KHR (the game never showed a
+// frame again after a trip to the home screen). vk_frame_begin makes a new surface and swapchain then.
+static void *surface_window;  // (Android: the ANativeWindow the surface was made for)
+static bool fresh_surface;    // (create_swapchain: the old swapchain belongs to the old surface, not a base for the new)
+static bool create_surface(VkSurfaceKHR *out) {
+    void *nw = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+    bool ok;
+#ifdef LARECOMP_VOLK
+    if (custom_vulkan) {  // (SDL's surface would come from its own copy of the system loader)
+        VkAndroidSurfaceCreateInfoKHR sci = {.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR, .window = nw};
+        ok = sci.window && vkCreateAndroidSurfaceKHR(g_vk.inst, &sci, NULL, out) == VK_SUCCESS;
+    } else
+#endif
+    ok = SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, out);
+    if (ok) surface_window = nw;
+    return ok;
+}
+static void create_swapchain(void);
+static void recreate_surface(const char *why) {
+    LOG("[vk] new window surface (%s)\n", why);
+    rec_drain();
+    rec_wait_late();
+    vkDeviceWaitIdle(g_vk.dev);
+    VkSurfaceKHR old = g_vk.surface, s;
+    if (!create_surface(&s)) { LOG("[vk] new window surface failed: %s\n", SDL_GetError()); return; }
+    g_vk.surface = s;
+    fresh_surface = true;
+    create_swapchain();
+    fresh_surface = false;
+    vkDestroySurfaceKHR(g_vk.inst, old, NULL);
+}
+
 static void create_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps));
@@ -1321,7 +1354,7 @@ static void create_swapchain(void) {
         .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = pre,
         .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = present_mode(), .clipped = VK_TRUE,
-        .oldSwapchain = old};
+        .oldSwapchain = fresh_surface ? VK_NULL_HANDLE : old};
     VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
     static const char *const modes[] = {"immediate", "mailbox", "fifo", "fifo-relaxed"};
     LOG("[vk] swapchain %ux%u, %u images, %s%s", ext.width, ext.height, count,
@@ -1440,6 +1473,13 @@ bool vk_frame_begin(const float clear[4]) {
     // The last present (the recorder's, record.c) must be done before the swapchain is used again - acquire and present
     // on the same swapchain are not allowed at the same time - and it may have asked for a new swapchain
     WAITING(rec_wait_presents(rec_presents_queued()));
+#ifdef __ANDROID__
+    {   // (no window surface: the app is in the background; another one: it came back - see create_surface)
+        void *nw = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
+        if (!nw) return false;
+        if (nw != surface_window) recreate_surface("the window has a new surface");
+    }
+#endif
     if (rec_present_recreate()) recreate_swapchain();
     if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height) recreate_swapchain();
     else if (g_vk.hdr != hdr_wanted()) recreate_swapchain();  // (HDR switched)
@@ -1473,6 +1513,11 @@ bool vk_frame_begin(const float clear[4]) {
         WAITING_AT(1, r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE,
                                           &cur_frame.image));
         rec_swapchain_unlock();
+    }
+    if (r == VK_ERROR_SURFACE_LOST_KHR) {  // (the window's surface went away under it: a new one for the next frame)
+        static int n;
+        if (n++ < 20) recreate_surface("surface lost");
+        return false;
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG("[vk] acquire failed: %d\n", r); return false; }
     cur_frame.acquired = acquire_sem[slot];
@@ -1788,7 +1833,8 @@ static int hang_watch(void *arg) {
     for (;;) {
         SDL_Delay(1000);
         uint64_t f = atomic_load(&g_window_frames), now = SDL_GetTicksNS();
-        bool away = window && (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED);
+        extern volatile bool g_app_background;
+        bool away = (window && (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)) || g_app_background;
         if (f != last || away) {
             if (told) LOG("[hang] frames again after %.0f s\n", (now - since) / 1e9);
             last = f, since = now, told = false;
@@ -2176,7 +2222,7 @@ void backend_present_now(NvnTexture *t, uint64_t frame) {
         if (g_settings.frame_gen) fg_mid = vk_fg_make(b, frame, at30);
         // (the display at 60 or more for 60 images a second: left to itself the phone went down to 30 Hz with the game;
         // at 30 the 30 too, so a 60/120 Hz panel shows every image on the same vsync phase - android.c, LARECOMP_DISPLAY_RATE)
-        plat_frame_rate_hint(window, g_settings.fps45 ? 90.0f : g_settings.frame_gen || g_settings.fps60 ? 60.0f : 30.0f);
+        plat_frame_rate_hint(window, g_settings.frame_gen || g_settings.fps60 ? 60.0f : 30.0f);
         static int tm = -1;
         if (tm < 0) tm = ENV("LARECOMP_FG_TIMING") != NULL;
         if (tm && g_settings.frame_gen) {  // (how many frames had an in-between image, and why not)
@@ -2514,6 +2560,23 @@ static void quick_exit_handler(void) {
 #endif
 }
 
+// The app's trips to the background (Android: the home screen, another app): g_app_background (runtime/hle/vi.c) stops
+// the game at its next present and the audio feeders until it's back. An event watch: SDL delivers these from the
+// thread that sees them, and on Android the window thread's own event loop is blocked while the app is paused.
+static bool SDLCALL app_events(void *data, SDL_Event *e) {
+    (void)data;
+    extern volatile bool g_app_background;
+    bool bg;
+    switch (e->type) {
+    case SDL_EVENT_WILL_ENTER_BACKGROUND: case SDL_EVENT_DID_ENTER_BACKGROUND: bg = true; break;
+    case SDL_EVENT_WILL_ENTER_FOREGROUND: case SDL_EVENT_DID_ENTER_FOREGROUND: bg = false; break;
+    default: return true;
+    }
+    if (__atomic_exchange_n(&g_app_background, bg, __ATOMIC_ACQ_REL) != bg)
+        LOG("[app] %s the background (t=%.1f)\n", bg ? "into" : "out of", SDL_GetTicks() / 1000.0);
+    return true;
+}
+
 void ui_window_init(void) {
     if (window) return;
     atexit(quick_exit_handler);
@@ -2538,15 +2601,8 @@ void ui_window_init(void) {
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
     if (g_settings.fullscreen && !ENV("LARECOMP_WINDOW") && !ENV("LARECOMP_HIDDEN")) SDL_SetWindowFullscreen(window, true);
     create_instance();
-#ifdef LARECOMP_VOLK
-    if (custom_vulkan) {  // (SDL's surface would come from its own copy of the system loader)
-        VkAndroidSurfaceCreateInfoKHR sci = {.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR,
-            .window = SDL_GetPointerProperty(SDL_GetWindowProperties(window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL)};
-        if (!sci.window || vkCreateAndroidSurfaceKHR(g_vk.inst, &sci, NULL, &g_vk.surface) != VK_SUCCESS)
-            FATAL("vkCreateAndroidSurfaceKHR failed\n");
-    } else
-#endif
-    if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
+    if (!create_surface(&g_vk.surface)) FATAL("window surface: %s\n", SDL_GetError());
+    SDL_AddEventWatch(app_events, NULL);
     pick_device();
     create_device();
     create_swapchain();

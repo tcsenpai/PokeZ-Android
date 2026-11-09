@@ -17,6 +17,7 @@
 #include "../hle.h"
 #include "../settings.h"
 #include "../ipc.h"
+extern volatile bool g_app_background;  // (runtime/hle/vi.c: the feeders stop while the app is in the background)
 
 // ------------------------------------------------------------------ audren: a CPU mixer modelled on
 // Ryujinx's AudioRenderer (VoiceState / DataSourceHelper / StateUpdater; MIT, Ryujinx Team and Contributors,
@@ -649,6 +650,10 @@ static void *renderer_tick(void *arg) {
         }
     }
     while (!r->quit) {
+        while (__atomic_load_n(&g_app_background, __ATOMIC_ACQUIRE) && !r->quit) {  // (the app in the background: no
+            struct timespec ts = {0, 20000000};                                     // sound, the game's audio waits)
+            nanosleep(&ts, NULL);
+        }
         if (r->stream) {
             while (SDL_GetAudioStreamQueued(r->stream) >= target && !r->quit) {
                 struct timespec ts = {0, 1000000};
@@ -1194,6 +1199,10 @@ static void *audout_thread(void *arg) {
             dev.format, dev_frames, target / (2 * (int)ch));
     }
     while (!a->quit) {
+        while (__atomic_load_n(&g_app_background, __ATOMIC_ACQUIRE) && !a->quit) {  // (the app in the background)
+            struct timespec ts = {0, 20000000};
+            nanosleep(&ts, NULL);
+        }
         a->loops++;
         if (g_audstat) audstat_tick(a, audstat_now());
         pthread_mutex_lock(&a->lock);

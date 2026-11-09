@@ -83,7 +83,7 @@ static bool fps60_holds(void) {
     static bool retry;  // (60 again after a fall back: the shorter test)
     static uint64_t t0, p0, back_at, seen_hitch;
     if (dyn < 0) dyn = !ENV("LARECOMP_FPS60_DYNAMIC") || atoi(ENV("LARECOMP_FPS60_DYNAMIC")) != 0;
-    int setting = g_settings.fps60 | g_settings.fps60_lock << 1 | g_settings.fps45 << 2;  // (the 45 mode: 60's state fresh)
+    int setting = g_settings.fps60 | g_settings.fps60_lock << 1;
     if (last_setting != setting) {  // (chosen again in F1: a new try)
         last_setting = setting;
         g_fps60_fell_back = retry = false, warm = slow = held_s = 0, backoff = 1, t0 = back_at = 0;
@@ -148,24 +148,10 @@ static bool fps60_holds(void) {
 int32_t rt_za_frame_cfg(int32_t cfg) {
     g_za_frame_hook = true;
     const char *e = ENV("LARECOMP_FPS");
-    // The 45 fps mode (the user's fps45): the game's own 30 fps machinery - two world steps and a present interval of
-    // 2, forced by pace.c's hold - over a 90 Hz vsync: each frame is 2/90 s of world and shown 22.2 ms apart, the same
-    // speed and smoothness as a real 45 fps. A frame the GPU misses (over 22.2 ms) still steps 2: the world slows a
-    // little instead of the 60 fps mode's cliff - and nothing retries, so it never oscillates. LARECOMP_FPS wins (tests).
-    // LARECOMP_FPS45_HZ=<hz>: that vsync instead of 90 - 80 makes it a 40 fps mode, each frame 25 ms = exactly three
-    // refreshes of a 120 Hz panel (the AYN Thor's top mode; 45 on it would alternate 2 and 3 refreshes).
-    extern volatile uint64_t g_vsync_period_ns;  // runtime/hle/vi.c
-    bool f45 = !e && g_settings.fps45;    static bool was45;
-    if (f45 != was45) {
-        was45 = f45;
-        const char *hz = ENV("LARECOMP_FPS45_HZ");
-        double v = hz && atof(hz) >= 40 && atof(hz) <= 240 ? atof(hz) : 90;
-        g_vsync_period_ns = f45 ? (uint64_t)(1e9 / v) : 16666667;
-        LOG("[pace] 45 fps mode %s: a %.0f Hz vsync, two world steps and a present every two\n", f45 ? "on" : "off", v);
-    }
-    extern bool g_fps45_hold;  // runtime/nvn/pace.c hold_30: forced on while in the mode
-    g_fps45_hold = f45;
-    bool on = e ? atoi(e) >= 60 : f45 ? false : fps60_holds();
+    // (No 45 fps mode: it was the game's 30 fps machinery over a 90 Hz vi.c vsync, but Z-A never asks for vi.c's vsync
+    // event, nvn/objects.c present_pace held it at 30 presents a second anyway, and the game steps its world in whole
+    // 1/60 s units - a real 45 would have run 1.5x. Measured identical to 30 on the AYN Thor: eval/reports/pz-PzPace.md.)
+    bool on = e ? atoi(e) >= 60 : fps60_holds();
     static int logged = -1;
     if (logged != (int)on) { logged = on; LOG("[pace] game frame mode %d -> %d (%s)\n", cfg, on ? 0 : cfg, on ? "60 fps" : "as is"); }
     {   // the game's own time, in vsyncs: each frame it steps max(mode + 1, the vsyncs that really passed) - a replay
@@ -181,5 +167,3 @@ int32_t rt_za_frame_cfg(int32_t cfg) {
     return on ? 0 : cfg;
 }
 uint64_t g_game_vsyncs;  // (see rt_za_frame_cfg)
-bool g_fps45_hold;  // (see rt_za_frame_cfg: the 45 fps mode forces pace.c's hold - only once the game's frame hook has
-                    // run: pace.c reaches here on frames before the game manager exists, and its pointer isn't mapped yet)

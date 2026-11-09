@@ -2,6 +2,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "../kernel.h"
 #include "nvn.h"
@@ -1037,6 +1038,24 @@ static void present_pace(int interval) {
     next += period;
 }
 
+// The app in the background (g_app_background, runtime/hle/vi.c): the game thread waits here, before its present, until
+// it's back - the whole game stops with it (its other threads wait for this one), the render thread runs dry and the
+// window's surface, gone meanwhile, is never asked for an image. (Counted as blocked: idle for the frame pacer.)
+static void background_wait(void) {
+    extern volatile bool g_app_background;
+    extern __thread uint64_t g_blocked_ns;
+    if (!__atomic_load_n(&g_app_background, __ATOMIC_ACQUIRE)) return;
+    uint64_t t0 = plat_now_ns();
+    LOG("[app] in the background: the game waits\n");
+    while (__atomic_load_n(&g_app_background, __ATOMIC_ACQUIRE)) {
+        struct timespec ts = {0, 50000000};
+        nanosleep(&ts, NULL);
+    }
+    uint64_t t = plat_now_ns() - t0;
+    g_blocked_ns += t;
+    LOG("[app] back after %.1f s: the game goes on\n", t / 1e9);
+}
+
 NVN(nvnQueuePresentTexture) {
     NvnWindow *w = HOST(NvnWindow, A(1));
     int i = (int)A(2);
@@ -1052,6 +1071,7 @@ NVN(nvnQueuePresentTexture) {
             g_present_tex[0] = pt ? (int)pt->width : 0;
             g_present_tex[1] = pt ? (int)pt->height : 0;
         }
+        background_wait();
         present_pace(w->interval);
         backend_present(HOST(NvnTexture, w->textures[i]));
         if (i < 8) w->present_seq[i] = renderer_fence_seq();  // (the submission just presented)

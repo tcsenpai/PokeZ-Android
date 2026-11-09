@@ -490,26 +490,19 @@ static void tab_display(bool in_game) {
         // start); in game only with the frame hook (a supported game version).
         extern bool g_za_frame_hook, g_fps60_fell_back;
         if (!in_game || g_za_frame_hook) {  // (g_game_is_la stays 1 until the boot: no help on the start screen)
-            int fr = g_settings.fps60 ? 2 : g_settings.fps45 ? 1 : 0;
-            const char *rates[] = {TR("30 fps (Switch)", "30 fps (Switch)"), TR("45 fps", "45 fps"), "60 fps"};
-            if (opt_choice(TR("Frame rate", "Taxa de quadros"), &fr, rates, 3, 0,
-                           TR("30 fps: as on the Switch. 45 fps: the game's own 30 fps pacing over a 90 Hz clock - two "
-                              "steps and a picture every other, at the right speed: smoother than 30 and far lighter than "
-                              "60; if a frame misses 45, the world slows a little instead of swinging between modes. 60 fps: "
-                              "the game presents every refresh and steps its world 1/60 s a frame - smoother still, but it "
-                              "needs a fast CPU and GPU: the game counts frames, not time, so below 60 fps everything moves "
-                              "in slow motion (see the next option).",
-                              "30 fps: como no Switch. 45 fps: o próprio ritmo de 30 fps do jogo sobre um clock de 90 Hz - "
-                              "dois passos e uma imagem a cada dois, na velocidade certa: mais fluido que 30 e muito mais "
-                              "leve que 60; se um quadro não alcançar 45, o mundo desacelera um pouco em vez de ficar "
-                              "alternando entre modos. 60 fps: o jogo mostra um quadro a cada atualização da tela e avança o "
-                              "mundo 1/60 s por quadro - mais fluido ainda, mas pede CPU e GPU rápidas: o jogo conta quadros, "
-                              "não tempo, então abaixo de 60 fps tudo fica em câmera lenta (veja a próxima opção)."))) {
-                g_settings.fps60 = fr == 2;
-                g_settings.fps45 = fr == 1;
+            int fr = g_settings.fps60 ? 1 : 0;
+            const char *rates[] = {TR("30 fps (Switch)", "30 fps (Switch)"), "60 fps"};
+            if (opt_choice(TR("Frame rate", "Taxa de quadros"), &fr, rates, 2, 0,
+                           TR("30 fps: as on the Switch. 60 fps: the game presents every refresh and steps its world 1/60 s "
+                              "a frame - smoother, but it needs a fast CPU and GPU: the game counts frames, not time, so "
+                              "below 60 fps everything moves in slow motion (see the next option).",
+                              "30 fps: como no Switch. 60 fps: o jogo mostra um quadro a cada atualização da tela e avança o "
+                              "mundo 1/60 s por quadro - mais fluido, mas pede CPU e GPU rápidas: o jogo conta quadros, não "
+                              "tempo, então abaixo de 60 fps tudo fica em câmera lenta (veja a próxima opção)."))) {
+                g_settings.fps60 = fr == 1;
             }
             bool fall = !g_settings.fps60_lock;
-            ImGui::BeginDisabled(!g_settings.fps60 || g_settings.fps45);
+            ImGui::BeginDisabled(!g_settings.fps60);
             if (opt_toggle(TR("Dynamic 30 / 60 fps", "30 / 60 fps dinâmico"), &fall, false,
                            TR("With 60 fps: when this PC doesn't keep 60 for a few seconds, the game goes to 30 fps by "
                               "itself instead of running in slow motion, and back to 60 once there is room again (the "
@@ -521,7 +514,7 @@ static void tab_display(bool in_game) {
                               "câmera lenta quando não acompanha.")))
                 g_settings.fps60_lock = !fall;
             ImGui::EndDisabled();
-            if (in_game && g_settings.fps60 && !g_settings.fps45 && g_fps60_fell_back)
+            if (in_game && g_settings.fps60 && g_fps60_fell_back)
                 ImGui::TextColored(ImVec4(0.95f, 0.71f, 0.27f, 1), "%s",
                                    TR("Running at 30 fps for now: 60 wasn't held (back to 60 when there is room).",
                                       "Rodando a 30 fps por enquanto: 60 não segurou (volta para 60 quando houver folga)."));

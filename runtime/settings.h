@@ -142,8 +142,6 @@ typedef struct {
     char rando_seed[128];  // active randomizer seed (rando/<name>/), empty = vanilla
     char rando_options[48];  // the Randomizer tab's New seed options: a seed ID without its random part (empty = defaults)
     bool fps60_lock;  // with fps60: stays at 60 even when this PC can't hold it (slow motion below; runtime/hle/framepace.c)
-    bool fps45;       // Z-A only: the game's 30 fps machinery at a 90 Hz vsync - two world steps and a present every
-                      // other, at the right speed: 45 fps (runtime/hle/framepace.c, runtime/hle/vi.c)
     bool frame_gen;   // at 30 fps, an image made between each two frames: shown at 60 (vulkan/exec.c vk_fg_make)
     int ui_lang;      // UI_LANG_*: the start screen's language (runtime/ui/launcher.mm); auto = the system's
     // mods/ folders (runtime/services/fs.c layers them): '|' between names. order: first wins where two replace the

@@ -41,8 +41,9 @@ force-stop + relançar (env.txt lido no início). Linhas `[gpuprof]` no log. Tem
 - `runtime/main.c` — boot; `runtime/kernel.c` — threads/fibers do jogo.
 - `runtime/hle/` — serviços do Switch refeitos. `framepace.c` é o coração do frame pacing do Z-A:
   `rt_za_frame_cfg()` intercepta o relógio do jogo (patch `tools/za_patches.py`, f_70019e3730): o jogo conta
-  vsyncs inteiros por quadro (`max(modo+1, passados)`); modo 60 = cfg 0; modo 45 = jogo em modo 30 (2 passos)
-  sobre vsync emulado de 90 Hz (`g_vsync_period_ns`, vi.c) + hold de present a cada 2 vsyncs.
+  vsyncs inteiros por quadro (`max(modo+1, passados)`, unidades fixas de 1/60 s); modo 60 = cfg 0. O Z-A nunca pede
+  o evento de vsync do vi.c: o relógio de quadros dele é o `present_pace` de `nvn/objects.c` (preso ao refresh medido
+  do display no Android).
 - `runtime/nvn/` — a GPU do Switch. `vulkan/exec.c` grava comandos; `vulkan/device.c` cria swapchain
   (pre-rotation no Android) e chama `pace_frame()`; `pace.c` segura o cadência (`hold_cadence`/`hold_30`);
   `output_scale.c` aplica a escala dinâmica; `shaders.c` tem os built-ins (GLSL → SPIR-V na hora).
@@ -73,11 +74,8 @@ force-stop + relançar (env.txt lido no início). Linhas `[gpuprof]` no log. Tem
 - **LOD (F1 > Vídeo > Nível de detalhe)**: Do jogo / Alto (bias -1.0) / Desempenho (bias +1.0, via za_tweaks).
 - **Pré-compilação de pipelines**: já existia (shader_prep); log mostra cache de 6,4 MB e 0 falhas.
 - **ADPF**: já existia (plat_perf_hint + térmico); não duplicar.
-- **Modo 45 fps** (`fps45`): implementado (vsync emulado 90 Hz + hold 2 em 2), mas **ainda não funciona no
-  aparelho**: o display fica a 60 Hz (o `plat_frame_rate_hint(90)` é chamado — ver device.c:2058 — mas o Android
-  não subiu a taxa; investigar `dumpsys display` antes/depois). Sem o display a 90, o hold espaça a 33 ms = 30 fps.
-  PENDENTE: confirmar o frame rate hint no lado Android e testar de novo; a alternativa é patch no relógio do jogo
-  (passos fracionários — trabalho maior, a mesma pesquisa do "FPS dinâmico").
+- **Modo 45 fps**: REMOVIDO (2026-11-09, PzPace). Nunca passou de 30 (present_pace segura 33 ms; o vi.c nem roda no
+  Z-A) e, se chegasse a 45, o mundo andaria 1,5x (passos de 1/60 s). `fps45` em inis antigos é lido e ignorado.
 - **Glitch nos olhos** (íris com faixa branca): NÃO é o LOD (persiste com za_lod=0). Aberto: investigar shader/
   textura do olho no backend Vulkan.
 - **Throttling**: com Turbo + cena pesada, o telefone entra em status 2/3 mesmo com cooler; o retry do 60 fps agora
@@ -101,7 +99,7 @@ force-stop + relançar (env.txt lido no início). Linhas `[gpuprof]` no log. Tem
 
 ## Pendências abertas
 
-- 45 fps: display a 90 Hz (ver acima) OU patch do relógio; medir de novo com gpuprof.
+- 45/40 fps de verdade: só com passos fracionários no relógio do jogo (eval/reports/pz-PzPace.md).
 - Glitch nos olhos: shader/textura do olho no backend.
 - Na pasta de testes: limpar `files/save` e `env.txt` do celular e restaurar `shadow_resolution = 0.5` no ini
   (o usuário aprovou copiar/apagar saves de teste).

@@ -10,15 +10,19 @@ static KEvent *vsync_event;
 uint32_t vi_vsync_handle(void) { return vsync_r; }
 volatile uint64_t g_vsync_count;  // vsyncs signalled so far (runtime/hle/framepace.c, runtime/nvn/pace.c)
 volatile uint64_t g_vsync_ns;     // plat_now_ns() of the latest (stored after the count: count >= the vsync it's from)
-volatile uint64_t g_vsync_period_ns = 16666667;  // 60 Hz; framepace.c's 45 fps mode sets 90 Hz (11.1 ms)
+volatile uint64_t g_vsync_period_ns = 16666667;  // 60 Hz
 uint64_t g_native_window;
+// The app is in the background (Android: another app in front, the home screen; set by the window's event watch,
+// runtime/nvn/vulkan/device.c app_events): the game thread waits at its next present (nvn/objects.c) and the audio
+// feeders stop (services/audio.c) until it's back - no frames for a surface that's gone, no CPU, no sound.
+volatile bool g_app_background;
 // LARECOMP_VSYNC_LOCK=<us>: the timer follows the display's own vsync (platform.h plat_display_vsync: Android's
 // Choreographer), firing that many microseconds after it, its period an exact multiple of the display's - a free timer
 // drifts against the panel by its clock's ppm, and a held 30 fps frame then lands on a different refresh now and then.
 // Corrected by at most 0.25 ms a tick (no jumps). Unset: the free timer.
 static void *vsync_thread(void *arg) {
     (void)arg;
-    uint64_t period = 16666667;  // (re-read each vsync: the 45 fps mode changes it on the fly)
+    uint64_t period = 16666667;  // (re-read each vsync)
     plat_thread_realtime(period);
     plat_thread_perf_core(PLAT_PERF_VSYNC);
     const char *lk = getenv("LARECOMP_VSYNC_LOCK");
