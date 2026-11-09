@@ -1,9 +1,16 @@
 // audren:u (audio renderer) and audout:u.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE  // (gettid, sched_getcpu: LARECOMP_AUDIO_STATS)
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
 #include <time.h>
+#if defined(__linux__)
+#include <sched.h>
+#include <unistd.h>
+#endif
 
 #include <SDL3/SDL.h>
 
@@ -1027,6 +1034,18 @@ SERVICE("audren:u", audren_u) {
 }
 
 // ------------------------------------------------------------------ audout (buffers released in real time)
+// LARECOMP_AUDIO_STATS=1: once a second per audio out, an [audstat] line - what the game delivered (buffers, frames,
+// longest gap between two appends, its queue depth), how long the output thread sat with nothing to play, what the
+// device found missing when it pulled (SDL's get callback: underruns, each one a gap of silence), and the level of
+// the game's samples (peak, clipped samples, RMS, all-zero buffers).
+typedef struct {
+    uint64_t t0, last_append, gap_max, starved_ns, frames, nsamp;
+    double sq;
+    uint32_t bufs, peak, clips, zero_bufs, qmin, qmax, smin;
+    uint32_t under_n, under_bytes;  // (written by SDL's device thread: __atomic)
+    int game_tid, game_cpu;
+} AudStat;
+
 typedef struct AudioOut {
     uint32_t rate, channels, state;
     uint64_t tags[64], sizes[64], datas[64];
@@ -1041,7 +1060,67 @@ typedef struct AudioOut {
     pthread_mutex_t lock;
     pthread_t thread;
     volatile bool quit;  // reboot (audio_reset)
+    AudStat st;
 } AudioOut;
+
+static int g_audstat = -1;
+static uint64_t audstat_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000000000ull + (uint64_t)t.tv_nsec;
+}
+static void SDLCALL audstat_pull(void *u, SDL_AudioStream *s, int additional, int total) {
+    (void)s, (void)total;
+    AudioOut *a = u;
+    if (additional <= 0 || a->state != 0 || !a->played) return;
+    __atomic_fetch_add(&a->st.under_n, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&a->st.under_bytes, (uint32_t)additional, __ATOMIC_RELAXED);
+}
+// (the game's thread, a->lock held)
+static void audstat_append(AudioOut *a, uint64_t size) {
+    uint64_t t = audstat_now();
+    if (a->st.last_append && t - a->st.last_append > a->st.gap_max) a->st.gap_max = t - a->st.last_append;
+    a->st.last_append = t;
+    a->st.bufs++;
+    a->st.frames += size / (2 * (a->channels ? a->channels : 2));
+    if ((uint32_t)a->queued > a->st.qmax) a->st.qmax = (uint32_t)a->queued;
+#if defined(__linux__)
+    a->st.game_tid = (int)gettid();
+    a->st.game_cpu = sched_getcpu();
+#endif
+}
+static void audstat_scan(AudioOut *a, const int16_t *s, uint64_t n) {
+    uint32_t pk = a->st.peak, clips = 0, nz = 0;
+    double sq = 0;
+    for (uint64_t i = 0; i < n; i++) {
+        int v = s[i], m = v < 0 ? -v : v;
+        nz |= (uint32_t)m;
+        if ((uint32_t)m > pk) pk = (uint32_t)m;
+        clips += m >= 32767;
+        sq += (double)v * v;
+    }
+    a->st.peak = pk, a->st.clips += clips, a->st.sq += sq, a->st.nsamp += n;
+    a->st.zero_bufs += !nz;
+}
+static void audstat_tick(AudioOut *a, uint64_t t) {
+    AudStat *s = &a->st;
+    if (!s->t0) { s->t0 = t; s->qmin = s->smin = ~0u; return; }
+    if (t - s->t0 < 1000000000ull) return;
+    uint32_t un = __atomic_exchange_n(&s->under_n, 0, __ATOMIC_RELAXED);
+    uint32_t ub = __atomic_exchange_n(&s->under_bytes, 0, __ATOMIC_RELAXED);
+    uint32_t bpms = 2 * (a->channels ? a->channels : 2) * (a->rate ? a->rate : 48000) / 1000;
+    pthread_mutex_lock(&a->lock);
+    LOG("[audstat] %p %.1fs: game %u bufs %llu frames (gap max %llu ms, queue %u-%u, tid %d cpu %d) | out: starved %llu "
+        "ms, stream min %d ms | device: %u underruns, %u ms missing | level: peak %.1f dBFS, %u clipped, rms %.1f dBFS, "
+        "%u silent bufs\n",
+        (void *)a, (t - s->t0) / 1e9, s->bufs, (unsigned long long)s->frames, (unsigned long long)(s->gap_max / 1000000),
+        s->qmin == ~0u ? 0 : s->qmin, s->qmax, s->game_tid, s->game_cpu, (unsigned long long)(s->starved_ns / 1000000),
+        s->smin == ~0u ? -1 : (int)(s->smin / bpms), un, ub / bpms, s->peak ? 20 * log10(s->peak / 32768.0) : -999.0,
+        s->clips, s->nsamp && s->sq > 0 ? 10 * log10(s->sq / s->nsamp / (32768.0 * 32768.0)) : -999.0, s->zero_bufs);
+    s->t0 = t, s->gap_max = 0, s->starved_ns = 0, s->frames = 0, s->nsamp = 0, s->sq = 0;
+    s->bufs = s->peak = s->clips = s->zero_bufs = s->qmax = 0, s->qmin = s->smin = ~0u;
+    pthread_mutex_unlock(&a->lock);
+}
 
 // Every renderer / audio out of this boot: a reboot stops their threads (they read guest memory and signal this
 // boot's kernel events) and closes their output streams.
@@ -1111,17 +1190,32 @@ static void *audout_thread(void *arg) {
         if (!SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(a->stream), &dev, &dev_frames) || dev_frames <= 0)
             dev_frames = 1024;
         target = 2 * dev_frames * 2 * (int)ch;  // bytes of s16 at the source rate (close enough at 48 kHz)
+        LOG("[audout] device %d Hz %d ch fmt %x, %d frames/period; release target %d frames\n", dev.freq, dev.channels,
+            dev.format, dev_frames, target / (2 * (int)ch));
     }
     while (!a->quit) {
         a->loops++;
+        if (g_audstat) audstat_tick(a, audstat_now());
         pthread_mutex_lock(&a->lock);
         uint64_t size = 0, tag = 0, data = 0;
         if (a->state == 0 && a->queued) { size = a->sizes[0]; tag = a->tags[0]; data = a->datas[0]; }
+        if (size && g_audstat && (uint32_t)a->queued < a->st.qmin) a->st.qmin = (uint32_t)a->queued;
         pthread_mutex_unlock(&a->lock);
-        if (!size) { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); continue; }
+        if (!size) {
+            uint64_t t = g_audstat && a->state == 0 && a->played ? audstat_now() : 0;
+            struct timespec ts = {0, 1000000};
+            nanosleep(&ts, NULL);
+            if (t) a->st.starved_ns += audstat_now() - t;
+            continue;
+        }
         uint64_t frames = size / (2 * ch);
         if (a->stream) {
             apply_gain(a->stream);
+            if (g_audstat) {
+                uint32_t q = (uint32_t)SDL_GetAudioStreamQueued(a->stream);
+                if (q < a->st.smin) a->st.smin = q;
+                if (data) audstat_scan(a, (const int16_t *)(uintptr_t)data, size / 2);
+            }
             if (data) SDL_PutAudioStreamData(a->stream, (const void *)(uintptr_t)data, (int)size);
             // a device that stops pulling (seen with PulseAudio) must not hold the buffer forever: the game's audio
             // thread waits for the release and everything else waits for it. Past a few buffers' time, let go.
@@ -1198,6 +1292,7 @@ static void audio_out(Service *s, IpcReq *req, IpcResp *resp) {
             a->sizes[a->queued] = size ? size : 4096;
             a->datas[a->queued] = size ? data : 0;
             a->queued++;
+            if (g_audstat) audstat_append(a, a->sizes[a->queued - 1]);
         }
         pthread_mutex_unlock(&a->lock);
         break;
@@ -1270,12 +1365,14 @@ SERVICE("audout:u", audout_u) {
         a->state = 1;
         pthread_mutex_init(&a->lock, NULL);
         a->event = kernel_create_event_pair(&a->ev_w, &a->ev_r);
+        if (g_audstat < 0) g_audstat = getenv("LARECOMP_AUDIO_STATS") && atoi(getenv("LARECOMP_AUDIO_STATS"));
         if (getenv("LARECOMP_AUDOUT_WAV")) a->wav = fopen(getenv("LARECOMP_AUDOUT_WAV"), "wb");
         if (!(getenv("LARECOMP_NO_AUDIO") && strcmp(getenv("LARECOMP_NO_AUDIO"), "0")) && SDL_InitSubSystem(SDL_INIT_AUDIO)) {
             SDL_AudioSpec spec = {SDL_AUDIO_S16, (int)a->channels, (int)a->rate};
             a->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
             if (a->stream) {
                 if (getenv("LARECOMP_AUDIO_GAIN")) SDL_SetAudioStreamGain(a->stream, (float)atof(getenv("LARECOMP_AUDIO_GAIN")));
+                if (g_audstat) SDL_SetAudioStreamGetCallback(a->stream, audstat_pull, a);
                 SDL_ResumeAudioStreamDevice(a->stream);
             }
         }
