@@ -1012,6 +1012,26 @@ static void present_pace(int interval) {
     if (interval <= 0) return;
     if (interval > 4) interval = 1;  // (not a sane interval: the console's default)
     uint64_t period = 16666667ull * (uint64_t)interval, now = plat_now_ns();
+    // (PzPace) A ~60 Hz display's own refresh, measured (platform.h plat_display_vsync: Android's Choreographer), not
+    // 16.667 ms: the AYN Thor's panel is 59.65 Hz, so a 30.000 fps cadence gained a refresh on it every 2.9 s and the
+    // compositor showed one frame for 1 refresh and the next for 3 (a hiccup every 2.9 s, SurfaceFlinger's present
+    // times). Pokémon Z-A never asks for vi.c's vsync event: this wait is its whole frame clock. Its phase is held where
+    // it first locked (slewed at most 0.25 ms a frame). LARECOMP_PRESENT_LOCK=0: the fixed 16.667 ms.
+    static int lock = -1;
+    static int64_t lock_ph = -1;
+    if (lock < 0) lock = !ENV("LARECOMP_PRESENT_LOCK") || atoi(ENV("LARECOMP_PRESENT_LOCK")) != 0;
+    uint64_t at, dp;
+    if (lock && plat_display_vsync(&at, &dp) && dp > 15833333ull && dp < 17500000ull) {
+        period = dp * (uint64_t)interval;
+        if (next > now && next - now <= period) {
+            int64_t ph = (((int64_t)(next - at) % (int64_t)dp) + (int64_t)dp) % (int64_t)dp;
+            if (lock_ph < 0) { lock_ph = ph; LOG("[nvn] presents locked to the display: %.3f ms refresh, phase %.2f ms\n", dp / 1e6, ph / 1e6); }
+            int64_t d = ph - lock_ph;
+            if (d > (int64_t)dp / 2) d -= (int64_t)dp;
+            if (d < -(int64_t)dp / 2) d += (int64_t)dp;
+            next -= d > 250000 ? 250000 : d < -250000 ? -250000 : d;
+        }
+    }
     if (next > now && next - now <= period) plat_sleep_until_ns(next);
     else next = now;  // (first frame, or more than a period late: no catching up)
     next += period;
