@@ -812,15 +812,15 @@ static bool hd_load_dds(NvnTexture *t, TexBackend *b, const char *path) {
     if (!memcmp(&fourcc, "DX10", 4)) { memcpy(&dxgi, d + 128, 4); off = 148; }
     else if (!memcmp(&fourcc, "DXT1", 4)) dxgi = 71;
     else if (!memcmp(&fourcc, "DXT5", 4)) dxgi = 77;
+    // (sRGB or not as the game's own texture, whatever the file says: a pack made from a dump holds the texture's
+    // stored values, and DDS writers disagree on the flag - the game's colour space is the one that reads them right)
+    bool srgb = vk_format_is_srgb(b->format);
     VkFormat vf;
     uint32_t bpb = 16;
     switch (dxgi) {
-    case 98: vf = VK_FORMAT_BC7_UNORM_BLOCK; break;
-    case 99: vf = VK_FORMAT_BC7_SRGB_BLOCK; break;
-    case 71: vf = VK_FORMAT_BC1_RGBA_UNORM_BLOCK; bpb = 8; break;
-    case 72: vf = VK_FORMAT_BC1_RGBA_SRGB_BLOCK; bpb = 8; break;
-    case 77: vf = VK_FORMAT_BC3_UNORM_BLOCK; break;
-    case 78: vf = VK_FORMAT_BC3_SRGB_BLOCK; break;
+    case 98: case 99: vf = srgb ? VK_FORMAT_BC7_SRGB_BLOCK : VK_FORMAT_BC7_UNORM_BLOCK; break;
+    case 71: case 72: vf = srgb ? VK_FORMAT_BC1_RGBA_SRGB_BLOCK : VK_FORMAT_BC1_RGBA_UNORM_BLOCK; bpb = 8; break;
+    case 77: case 78: vf = srgb ? VK_FORMAT_BC3_SRGB_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK; break;
     default: free(d); LOG("[tex] %s: unsupported DDS format %u\n", path, dxgi); return false;
     }
     if (!levels) levels = 1;
