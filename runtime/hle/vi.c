@@ -23,7 +23,8 @@ static void *vsync_thread(void *arg) {
     plat_thread_perf_core(PLAT_PERF_VSYNC);
     const char *lk = getenv("LARECOMP_VSYNC_LOCK");
     int64_t lock_off = lk && atoi(lk) > 0 ? (int64_t)atoi(lk) * 1000 : -1;
-    int locked_said = 0;
+    int locked_said = 0, ticks = 0;
+    if (lock_off >= 0) LOG("[vi] vsync lock asked: %.2f ms after the display's vsync\n", lock_off / 1e6);
     uint64_t next = plat_now_ns();
     for (;;) {
         period = g_vsync_period_ns;
@@ -39,8 +40,13 @@ static void *vsync_thread(void *arg) {
                 next -= ph > 250000 ? 250000 : ph < -250000 ? -250000 : ph;
                 if (!locked_said++) LOG("[vi] vsync locked to the display's: %.3f ms (%llu refreshes), %.2f ms after it\n",
                                         period / 1e6, (unsigned long long)r, lock_off / 1e6);
+            } else if (locked_said == 0 && ticks == 600) {
+                LOG("[vi] vsync lock: the display's %.3f ms doesn't divide the timer's %.3f ms: free timer\n", dp / 1e6, period / 1e6);
             }
+        } else if (lock_off >= 0 && ticks == 600) {
+            LOG("[vi] vsync lock: no display vsync after 600 ticks: free timer\n");
         }
+        ticks++;
         next += period;
         plat_sleep_until_ns(next);
         uint64_t now = plat_now_ns();

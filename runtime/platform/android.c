@@ -298,7 +298,8 @@ void plat_frame_rate_hint(void *sdl_window, float fps) {
 static _Atomic uint64_t g_dv_at, g_dv_period, g_dv_nominal;
 static atomic_bool g_dv_reset;
 static void dv_frame(int64_t t, void *data) {
-    static uint64_t prev, acc_ns, acc_k, shortest = UINT64_MAX;
+    static uint64_t prev, acc_ns, acc_k, shortest = UINT64_MAX, calls;
+    if (!calls++) fprintf(stderr, "[display] vsync tracker: first display vsync\n");
     if (atomic_exchange(&g_dv_reset, false)) acc_ns = acc_k = 0;
     if (prev && (uint64_t)t > prev) {
         uint64_t iv = (uint64_t)t - prev, nom = atomic_load(&g_dv_nominal);
@@ -328,12 +329,17 @@ static void dv_rate(int64_t period, void *data) {  // (the display's mode, when 
 static void *dv_thread(void *a) {
     (void)a;
     pthread_setname_np(pthread_self(), "za-dispvsync");
-    ALooper_prepare(0);
+    ALooper *lp = ALooper_prepare(0);
     AChoreographer *c = AChoreographer_getInstance();
+    fprintf(stderr, "[display] vsync tracker: looper %p, choreographer %p\n", (void *)lp, (void *)c);
     if (!c) return NULL;
     AChoreographer_registerRefreshRateCallback(c, dv_rate, NULL);
     AChoreographer_postFrameCallback64(c, dv_frame, NULL);
-    for (;;) ALooper_pollOnce(-1, NULL, NULL, NULL);
+    for (;;) {
+        int r = ALooper_pollOnce(-1, NULL, NULL, NULL);
+        static int said;
+        if (r != ALOOPER_POLL_CALLBACK && said++ < 5) fprintf(stderr, "[display] vsync tracker: looper poll %d\n", r);
+    }
     return NULL;
 }
 static void dv_start(void) {
