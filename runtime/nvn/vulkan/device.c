@@ -2572,6 +2572,8 @@ static bool SDLCALL app_events(void *data, SDL_Event *e) {
     case SDL_EVENT_WILL_ENTER_FOREGROUND: case SDL_EVENT_DID_ENTER_FOREGROUND: bg = false; break;
     default: return true;
     }
+    extern void rt_pause_clock(bool pause);  // (kernel.c: the game's clock stops with it; idempotent)
+    rt_pause_clock(bg);
     if (__atomic_exchange_n(&g_app_background, bg, __ATOMIC_ACQ_REL) != bg)
         LOG("[app] %s the background (t=%.1f)\n", bg ? "into" : "out of", SDL_GetTicks() / 1000.0);
     return true;

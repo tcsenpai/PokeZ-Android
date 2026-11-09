@@ -79,9 +79,28 @@ void kernel_signal(KObject *o) {
 
 // ------------------------------------------------------------------ time
 
+extern volatile bool g_app_background;  // (runtime/hle/vi.c)
+// The app in the background (runtime/hle/vi.c g_app_background, nvn/objects.c background_wait): the game's clock
+// stops there and goes on from the same tick when it's back, as a console's does in sleep mode - not a 2-minute jump
+// for the game to catch up on. rt_pause_clock(true / false) from the window's event watch; the clock never goes back.
+static uint64_t clock_frozen_at, clock_off, clock_last;  // (__atomic builtins)
+void rt_pause_clock(bool pause) {
+    uint64_t now = plat_now_ns();
+    if (pause) { uint64_t z = 0; __atomic_compare_exchange_n(&clock_frozen_at, &z, now, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); return; }
+    uint64_t f = __atomic_load_n(&clock_frozen_at, __ATOMIC_ACQUIRE);
+    if (!f) return;
+    __atomic_fetch_add(&clock_off, now > f ? now - f : 0, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&clock_frozen_at, 0, __ATOMIC_RELEASE);
+}
 uint64_t rt_ticks(void) {
     // 19.2 MHz system tick
     uint64_t ns = plat_now_ns();
+    uint64_t f = __atomic_load_n(&clock_frozen_at, __ATOMIC_ACQUIRE);
+    if (f && ns > f) ns = f;
+    ns -= __atomic_load_n(&clock_off, __ATOMIC_ACQUIRE);
+    uint64_t last = __atomic_load_n(&clock_last, __ATOMIC_RELAXED);  // (monotonic across a resume's two stores)
+    while (ns > last && !__atomic_compare_exchange_n(&clock_last, &last, ns, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    if (ns < last) ns = last;
     static double scale = -1;
     if (scale < 0) scale = getenv("LARECOMP_TICK_SCALE") ? atof(getenv("LARECOMP_TICK_SCALE")) : 1.0;
     if (scale != 1.0) ns = (uint64_t)(ns * scale);
@@ -1181,6 +1200,7 @@ static void *hang_watch(void *arg) {
     uint64_t s = (uint64_t)(uintptr_t)arg, dumped_since = 0;
     for (int dumps = 0; dumps < 6;) {
         sleep(1);
+        if (g_app_background) continue;  // (the app in the background: the game waits on purpose, presents stop)
         char why[256];
         int n = 0;
         pthread_mutex_lock(&g_klock);
