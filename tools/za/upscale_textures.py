@@ -94,8 +94,12 @@ else:
     print('no Real-ESRGAN found: Lanczos + unsharp mask')
     for i, f in enumerate(todo):
         im = Image.open(f).convert('RGBA')
-        up = im.resize((im.width * args.scale, im.height * args.scale), Image.LANCZOS)
-        up = up.filter(ImageFilter.UnsharpMask(radius=1.2, percent=60, threshold=2))
+        want = (im.width * args.scale, im.height * args.scale)
+        # the colour and the alpha each on its own: an RGBA resize weights by alpha and blanks the colour of
+        # transparent texels (as for Real-ESRGAN above)
+        up = im.convert('RGB').resize(want, Image.LANCZOS).filter(ImageFilter.UnsharpMask(radius=1.2, percent=60, threshold=2))
+        up = up.convert('RGBA')
+        up.putalpha(im.getchannel('A').resize(want, Image.LANCZOS))
         up.save(os.path.join(args.dst, os.path.basename(f)))
         if i % 100 == 0:
             print(f'  {i}/{len(todo)}', flush=True)

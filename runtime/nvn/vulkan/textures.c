@@ -651,12 +651,16 @@ void vk_textures_reset(void) {
 // The same way, whatever the HD setting: the game's own button icons relabelled for the prompts' style
 // (textures/prompts/<style>, runtime/hle/pl.c pl_prompt_set; made by tools/za/prompt_textures.py), ahead of the pack.
 static int hd_on = -1, hd_dump = -1;
-typedef struct { uint64_t *h; int n; char dir[48]; } HdSet;  // sorted hashes of <dir>/*.png, *.dds
+typedef struct { uint64_t *h; int n; char dir[600]; } HdSet;  // sorted hashes of <dir>/*.png, *.dds (dir: absolute)
 static HdSet hd_sets[2];  // [0] button prompts, [1] HD pack
 static int hd_cmp(const void *a, const void *b) { uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b; return x < y ? -1 : x > y; }
 
 static void hd_scan(HdSet *s, const char *dir) {
-    snprintf(s->dir, sizeof s->dir, "%s", dir);
+    // (an absolute path for the loads: on Android SDL_LoadPNG reads a relative path from the app's internal storage
+    // or the APK's assets, not the data folder - the external one - that the game runs in, so PNG packs never loaded)
+    char *cwd = SDL_GetCurrentDirectory();
+    snprintf(s->dir, sizeof s->dir, "%s%s", cwd ? cwd : "", dir);
+    SDL_free(cwd);
     DIR *d = opendir(dir);
     if (!d) return;
     int cap = 0;
@@ -682,7 +686,13 @@ static void hd_init(void) {
     hd_on = e ? atoi(e) != 0 : g_settings.tex_hd;
     e = ENV("LARECOMP_TEX_DUMP");
     hd_dump = e ? atoi(e) != 0 : g_settings.tex_dump;
-    if (hd_dump) { SDL_CreateDirectory("textures"); SDL_CreateDirectory("textures/dump"); }
+    if (hd_dump) {  // (absolute: SDL on Android puts a relative folder in the app's internal storage, not the data folder)
+        char *cwd = SDL_GetCurrentDirectory();
+        char dump[640];
+        snprintf(dump, sizeof dump, "%stextures/dump", cwd ? cwd : "");
+        SDL_free(cwd);
+        SDL_CreateDirectory(dump);  // (and textures/)
+    }
     extern const char *pl_prompt_set(void);
     const char *set = pl_prompt_set();
     char dir[48];
@@ -705,13 +715,37 @@ static bool hd_candidate(const NvnTexture *t, const TexBackend *b) {
            t->width >= 16 && t->height >= 16 && !(t->flags & 0x10);
 }
 
-static bool hd_load_dds(NvnTexture *t, TexBackend *b, uint64_t h, const char *path);
+static bool hd_load_dds(NvnTexture *t, TexBackend *b, const char *path);
+static bool hd_load_png(NvnTexture *t, TexBackend *b, const char *path);
 
+// (each replacement logged with its cost: the file's load and decode on this thread, the image's GPU memory against
+// the game's data, and running totals - "[tex] HD")
 static bool hd_replace(NvnTexture *t, TexBackend *b, uint64_t h) {
-    char path[80];
+    uint64_t t0 = SDL_GetTicksNS();
+    char path[640];
     snprintf(path, sizeof path, "%s/%016llx.dds", hd_find(h)->dir, (unsigned long long)h);
-    if (hd_load_dds(t, b, h, path)) return true;
-    snprintf(path, sizeof path, "%s/%016llx.png", hd_find(h)->dir, (unsigned long long)h);
+    bool ok = hd_load_dds(t, b, path);
+    if (!ok) {
+        snprintf(path, sizeof path, "%s/%016llx.png", hd_find(h)->dir, (unsigned long long)h);
+        ok = hd_load_png(t, b, path);
+    }
+    if (!ok) return false;
+    static int n;
+    static double ms_sum;
+    static uint64_t mem_sum, game_sum;
+    VmaAllocationInfo ai;
+    vmaGetAllocationInfo(g_vk.vma, b->mem, &ai);
+    double ms = (double)(SDL_GetTicksNS() - t0) / 1e6;
+    uint64_t game = tegra_total_size(&t->layout);
+    n++, ms_sum += ms, mem_sum += ai.size, game_sum += game;
+    if (n <= 50 || n % 100 == 0)
+        LOG("[tex] HD %016llx: %ux%u (%u levels, %.2f MB) for the game's %ux%u (format %#x, %.2f MB), %.1f ms; %d so far: "
+            "%.1f MB for the game's %.1f MB, %.0f ms\n", (unsigned long long)h, b->width, b->height, b->levels, ai.size / 1048576.0,
+            t->width, t->height, t->format, game / 1048576.0, ms, n, mem_sum / 1048576.0, game_sum / 1048576.0, ms_sum);
+    return true;
+}
+
+static bool hd_load_png(NvnTexture *t, TexBackend *b, const char *path) {
     SDL_Surface *s0 = SDL_LoadPNG(path);
     if (!s0) { LOG("[tex] %s: %s\n", path, SDL_GetError()); return false; }
     SDL_Surface *s = SDL_ConvertSurface(s0, SDL_PIXELFORMAT_ABGR8888);  // (R, G, B, A bytes)
@@ -754,14 +788,12 @@ static bool hd_replace(NvnTexture *t, TexBackend *b, uint64_t h) {
         rec_CmdBlitImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
     }
     rec_CmdPipelineBarrier2(cb, &di);
-    static int n;
-    if (n++ < 20) LOG("[tex] HD %016llx: %ux%u for %ux%u\n", (unsigned long long)h, w, hh, t->width, t->height);
     return true;
 }
 
 // A .dds pack texture: block-compressed, every mip level in the file (DX10 header: BC7 / BC1 / BC3, sRGB or not; or
 // the legacy DXT1 / DXT5 codes)
-static bool hd_load_dds(NvnTexture *t, TexBackend *b, uint64_t h, const char *path) {
+static bool hd_load_dds(NvnTexture *t, TexBackend *b, const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return false;
     fseek(f, 0, SEEK_END);
@@ -830,8 +862,6 @@ static bool hd_load_dds(NvnTexture *t, TexBackend *b, uint64_t h, const char *pa
                            .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
     rec_CmdPipelineBarrier2(cb, &di);
-    static int n;
-    if (n++ < 20) LOG("[tex] HD %016llx: %ux%u (%u levels) for %ux%u\n", (unsigned long long)h, w, hh, levels, t->width, t->height);
     return true;
 }
 
@@ -839,9 +869,17 @@ static bool hd_load_dds(NvnTexture *t, TexBackend *b, uint64_t h, const char *pa
 // looked up in the pack again (the next upload check rehashes it)
 static void hd_switch(void) {
     static int last = -1;
-    static long flip_at = -2;  // (tests: LARECOMP_TEX_HD_FLIP=<frame> switches the setting at that frame, as F1 would)
-    if (flip_at == -2) { const char *e = ENV("LARECOMP_TEX_HD_FLIP"); flip_at = e ? atol(e) : -1; }
-    if (flip_at >= 0 && vk_frame_counter() == (uint64_t)flip_at) g_settings.tex_hd = !g_settings.tex_hd;
+    // (tests: LARECOMP_TEX_HD_FLIP=<frame>[,<every>] switches the setting at that frame, as F1 would, and then every
+    // <every> frames: original / HD pictures of one still view in one run, told apart by the "[tex] textures:" lines)
+    static long flip_at = -2, flip_every;
+    if (flip_at == -2) {
+        const char *e = ENV("LARECOMP_TEX_HD_FLIP");
+        flip_at = e ? atol(e) : -1;
+        if (e && strchr(e, ',')) flip_every = atol(strchr(e, ',') + 1);
+    }
+    uint64_t fr = vk_frame_counter();
+    if (flip_at >= 0 && fr >= (uint64_t)flip_at && (fr == (uint64_t)flip_at || (flip_every > 0 && (fr - flip_at) % flip_every == 0)))
+        g_settings.tex_hd = !g_settings.tex_hd;
     hd_init();
     if (last < 0) { last = g_settings.tex_hd; return; }
     if (g_settings.tex_hd == last) return;
@@ -864,10 +902,10 @@ static void hd_switch(void) {
             n++;
         }
     }
-    LOG("[tex] textures: %s (%d re-uploaded)\n", hd_on ? "HD" : "original", n);
+    LOG("[tex] textures: %s (%d re-uploaded) at frame %llu\n", hd_on ? "HD" : "original", n, (unsigned long long)fr);
 }
 
-// Dumps: queued at upload, saved between frames (vk_texdump_process, from the present: no pass to interrupt)
+// Dumps: queued at upload, saved between frames (vk_hd_switch_frame, from the present: no pass to interrupt)
 typedef struct { NvnTexture *t; uint64_t h; } HdDump;
 static HdDump hd_q[4096];
 static int hd_qn;
@@ -887,8 +925,9 @@ static void hd_forget(NvnTexture *t) {
 }
 
 void renderer_save_texture_tex(TexBackend *b, const char *path);
-void vk_hd_switch_frame(void) { hd_switch(); }  // (device.c backend_present_now, each frame)
-void vk_texdump_process(void) {
+// (device.c backend_present_now, each frame: the F1 switch, then a few of the queued dumps. The dumps were saved by a
+// vk_texdump_process nothing called any more, so LARECOMP_TEX_DUMP / tex_dump wrote no file.)
+void vk_hd_switch_frame(void) {
     hd_switch();
     if (!hd_qn) return;
     int done = 0, k = 0;
