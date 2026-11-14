@@ -1,0 +1,2 @@
+# speed.sh: in-app shots after the camera turn (compare runs with analysis/montage.py)
+LARECOMP_SHOT_AT=1600,1640,1680,1720

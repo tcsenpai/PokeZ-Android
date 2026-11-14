@@ -1,0 +1,4 @@
+# Device-side scripts for Android's sh (mksh/toybox), sourced or run without a shebang. Expansions are integers,
+# sysfs paths and fixed names: word splitting is never an issue there. lib.sh defines what the scenarios use.
+shell=sh
+disable=SC1091,SC2034,SC2046,SC2086,SC2154,SC2231,SC3043

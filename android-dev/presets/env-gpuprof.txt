@@ -1,0 +1,4 @@
+# GPU time per pass every 4th frame + Vulkan exec stats (analysis/gpuprof.py)
+LARECOMP_LOG_PACE=1
+LARECOMP_GPUPROF_EVERY=4
+LARECOMP_VK_EXEC_STATS=1

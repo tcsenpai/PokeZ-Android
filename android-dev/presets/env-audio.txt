@@ -1,0 +1,6 @@
+# audio: per-second [audstat] lines (analysis/audstat.py), the game's raw output to files/audout.raw (analysis/audraw.py; PULL_FILES=audout.raw)
+LARECOMP_AUDIO_STATS=1
+LARECOMP_LOG_PACE=1
+LARECOMP_AUDOUT_WAV=/storage/emulated/0/Android/data/org.recomp.za/files/audout.raw
+LARECOMP_SCREENSHOT_EVERY=300
+LARECOMP_SCREENSHOT_FROM=600

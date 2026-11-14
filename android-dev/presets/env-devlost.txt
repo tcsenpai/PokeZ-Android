@@ -1,0 +1,6 @@
+# device-lost hunting: skipped draws, pipeline builds, the last submissions before a VK_ERROR_DEVICE_LOST, late textures
+LARECOMP_LOG_PACE=1
+LARECOMP_LOG_SKIPS=1
+LARECOMP_LOG_BUILDS=1
+LARECOMP_VK_DEVLOST_TRACE=1
+LARECOMP_TEX_LOG_LATE=1

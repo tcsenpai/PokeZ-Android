@@ -1,0 +1,4 @@
+# Turnip only (the packaged driver): u_trace render passes to files/utrace.txt (analysis/utrace.py; PULL_FILES=utrace.txt)
+LARECOMP_LOG_PACE=1
+MESA_GPU_TRACES=print
+MESA_GPU_TRACEFILE=/storage/emulated/0/Android/data/org.recomp.za/files/utrace.txt

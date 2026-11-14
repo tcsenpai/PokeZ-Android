@@ -1,0 +1,4 @@
+# texture-pack A/B: HD/original switched at frame 630 then every 120 frames, an in-app shot every 60 (analysis/texmod/ab.py)
+LARECOMP_TEX_HD_FLIP=630,120
+LARECOMP_SCREENSHOT_EVERY=60
+LARECOMP_SCREENSHOT_FROM=600

@@ -1,0 +1,3 @@
+# pacing logs: a [pace] line per frame, [fg] on-screen timing (analysis/pace.py, pace-log.py, sweep.py)
+LARECOMP_FG_TIMING=1
+LARECOMP_LOG_PACE=1

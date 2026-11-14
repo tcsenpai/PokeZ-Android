@@ -1,0 +1,4 @@
+# gameplay with pacing logs and an in-app shot every 90 frames from frame 900 (act.sh, look.sh, manual play)
+LARECOMP_LOG_PACE=1
+LARECOMP_SCREENSHOT_EVERY=90
+LARECOMP_SCREENSHOT_FROM=900

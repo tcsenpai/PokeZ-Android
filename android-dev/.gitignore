@@ -1,0 +1,11 @@
+config.sh
+# run outputs, pulled frames and analysis results never belong in the repo
+out/
+runs/
+*.apk
+*.tar
+*.png
+*.jpg
+*.mp4
+*.raw
+__pycache__/

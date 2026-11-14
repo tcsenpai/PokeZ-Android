@@ -1,0 +1,4 @@
+# dump every 2D colour texture to files/textures/dump/<hash>.png (device/pull-texdump.sh; game art: never commit)
+LARECOMP_TEX_DUMP=1
+LARECOMP_SCREENSHOT_EVERY=60
+LARECOMP_SCREENSHOT_FROM=900

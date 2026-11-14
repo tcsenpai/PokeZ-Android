@@ -1,0 +1,4 @@
+# bg.sh: on-screen timing, an in-app shot every 300 frames from frame 1200 (before/after the background)
+LARECOMP_FG_TIMING=1
+LARECOMP_SCREENSHOT_EVERY=300
+LARECOMP_SCREENSHOT_FROM=1200
